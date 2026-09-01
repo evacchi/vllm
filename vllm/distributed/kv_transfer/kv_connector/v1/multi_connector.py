@@ -466,6 +466,18 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 return metadata
         return None
 
+    def quiesce(self, timeout: float | None = None) -> None:
+        for connector in self._connectors:
+            connector.quiesce(timeout)
+
+    def reinitialize(self) -> None:
+        for connector in self._connectors:
+            connector.reinitialize()
+
+    def verify(self) -> None:
+        for connector in self._connectors:
+            connector.verify()
+
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
     ) -> None:

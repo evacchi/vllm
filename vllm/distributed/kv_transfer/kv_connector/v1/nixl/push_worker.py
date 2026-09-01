@@ -130,7 +130,15 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     # --- Lifecycle ----------------------------------------------------- #
 
+    def _stop_push_writer_for_lifecycle(self):
+        self._push_writer_stop.set()
+        self._push_writer_wake.set()
+        if self._push_writer_thread is not None:
+            self._push_writer_thread.join(timeout=2)
+            self._push_writer_thread = None
+
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
+        self._push_writer_stop.clear()
         super().register_kv_caches(kv_caches)
         if self._push_writer_thread is None:
             self._push_writer_thread = threading.Thread(
