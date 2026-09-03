@@ -2259,6 +2259,7 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
 def test_release_transport_state_retains_registered_cache_mapping():
     """Releasing NIXL state must not discard tensors needed for rebuild."""
     worker = object.__new__(NixlConnectorWorker)
+    worker.shutdown = MagicMock()
     caches = {"layer": MagicMock()}
     worker._registered_kv_caches = dict(caches)
     worker.device_kv_caches = dict(caches)
@@ -2294,6 +2295,7 @@ def test_release_transport_state_retains_registered_cache_mapping():
 def test_push_lifecycle_rejects_a_writer_that_does_not_stop():
     """Reinitialization must not proceed while the old push writer is alive."""
     worker = object.__new__(NixlPushConnectorWorker)
+    worker.shutdown = MagicMock()
     worker._push_writer_stop = threading.Event()
     worker._push_writer_wake = threading.Event()
     worker._push_writer_thread = MagicMock()
@@ -2310,6 +2312,7 @@ def test_push_lifecycle_rejects_a_writer_that_does_not_stop():
 def test_push_lifecycle_discards_queued_work():
     """Queued push requests must not be replayed after transport rebuild."""
     worker = object.__new__(NixlPushConnectorWorker)
+    worker.shutdown = MagicMock()
     worker._reg_send_inbox = queue.Queue()
     worker._finished_blocks_inbox = queue.Queue()
     worker._deferred_push_inbox = queue.Queue()
@@ -2345,6 +2348,7 @@ def test_push_lifecycle_discards_queued_work():
 def test_publish_handshake_metadata_propagates_failures():
     """A failed metadata update must make reinitialization fail visibly."""
     worker = object.__new__(NixlConnectorWorker)
+    worker.shutdown = MagicMock()
     worker.xfer_handshake_metadata = MagicMock()
     worker.tp_rank = 0
     worker.vllm_config = SimpleNamespace(
