@@ -4,6 +4,7 @@
 import contextlib
 import inspect
 import os
+import queue
 import tempfile
 import textwrap
 import time
@@ -42,6 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorWorker,
     NixlHandshakePayload,
     NixlKVConnectorStats,
+    NixlPushConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     compute_nixl_compatibility_hash,
@@ -2233,7 +2235,7 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
         worker.shutdown()
         worker.shutdown()
 
-        mock_exec.shutdown.assert_called_with(wait=False)
+        mock_exec.shutdown.assert_called_with(wait=True, cancel_futures=True)
 
         # Same sequence on scheduler.shutdown()
         scheduler.shutdown()
@@ -2251,6 +2253,111 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
         assert mock_dereg.call_count == 2
         mock_dereg.assert_any_call("desc1")
         mock_dereg.assert_any_call("desc2")
+
+
+def test_release_transport_state_retains_registered_cache_mapping():
+    """Releasing NIXL state must not discard tensors needed for rebuild."""
+    worker = object.__new__(NixlConnectorWorker)
+    caches = {"layer": MagicMock()}
+    worker._registered_kv_caches = dict(caches)
+    worker.device_kv_caches = worker._registered_kv_caches
+    worker.host_xfer_buffers = {}
+    worker._handshake_initiation_executor = None
+    worker._recving_transfers = {}
+    worker.src_xfer_handles_by_block_size = {}
+    worker.src_xfer_handles_by_tp_ratio = {}
+    worker._remote_agents = {}
+    worker._engine_clock_offset = {}
+    worker.kv_caches_base_addr = defaultdict(dict)
+    worker.dst_xfer_side_handles = defaultdict(dict)
+    worker.dst_num_blocks = {}
+    worker._handshake_futures = {}
+    worker._engine_last_active = {}
+    worker._registered_descs = []
+    worker.xfer_handshake_metadata = None
+    worker.compat_hash = None
+    worker.transfer_topo = None
+    worker.block_len_per_layer = []
+    worker.block_stride_per_layer = []
+    worker._region_is_mla = []
+    worker._ssm_region_indices = []
+    worker._scratch_region_indices = []
+    worker._ple_region_index = None
+
+    worker._release_transport_state()
+
+    assert worker._registered_kv_caches == caches
+    assert worker.device_kv_caches == {}
+
+
+def test_push_lifecycle_rejects_a_writer_that_does_not_stop():
+    """Reinitialization must not proceed while the old push writer is alive."""
+    worker = object.__new__(NixlPushConnectorWorker)
+    worker._push_writer_stop = threading.Event()
+    worker._push_writer_wake = threading.Event()
+    worker._push_writer_thread = MagicMock()
+    worker._push_writer_thread.is_alive.return_value = True
+
+    with pytest.raises(RuntimeError, match="push writer did not stop"):
+        worker._stop_push_writer_for_lifecycle()
+
+    worker._push_writer_thread.join.assert_called_once_with(timeout=2)
+    assert worker._push_writer_stop.is_set()
+    assert worker._push_writer_wake.is_set()
+
+
+def test_push_lifecycle_discards_queued_work():
+    """Queued push requests must not be replayed after transport rebuild."""
+    worker = object.__new__(NixlPushConnectorWorker)
+    worker._reg_send_inbox = queue.Queue()
+    worker._finished_blocks_inbox = queue.Queue()
+    worker._deferred_push_inbox = queue.Queue()
+    worker._pending_completion_notifs = queue.Queue()
+    worker._evict_finished_inbox = queue.Queue()
+    worker._push_finished_blocks = {"request": [1]}
+    worker._pending_d_registrations = {"request": {"agent": "old"}}
+    for work_queue in (
+        worker._reg_send_inbox,
+        worker._finished_blocks_inbox,
+        worker._deferred_push_inbox,
+        worker._pending_completion_notifs,
+        worker._evict_finished_inbox,
+    ):
+        work_queue.put("stale")
+
+    worker._discard_push_work_for_lifecycle()
+
+    assert all(
+        work_queue.empty()
+        for work_queue in (
+            worker._reg_send_inbox,
+            worker._finished_blocks_inbox,
+            worker._deferred_push_inbox,
+            worker._pending_completion_notifs,
+            worker._evict_finished_inbox,
+        )
+    )
+    assert not worker._push_finished_blocks
+    assert not worker._pending_d_registrations
+
+
+def test_publish_handshake_metadata_propagates_failures():
+    """A failed metadata update must make reinitialization fail visibly."""
+    worker = object.__new__(NixlConnectorWorker)
+    worker.xfer_handshake_metadata = MagicMock()
+    worker.tp_rank = 0
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_index=0)
+    )
+
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.zmq_ctx",
+            side_effect=OSError("side channel unavailable"),
+        ),
+        pytest.raises(RuntimeError, match="metadata"),
+    ):
+        worker._publish_handshake_metadata()
 
 
 # ── TTL-based remote engine eviction tests ──────────────────────────

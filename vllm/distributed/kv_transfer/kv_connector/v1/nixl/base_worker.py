@@ -1093,7 +1093,10 @@ class NixlBaseConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
-        self._registered_kv_caches = kv_caches
+        # Keep an independent mapping: device_kv_caches is cleared when the
+        # transport is released, but the tensors must remain available for a
+        # later transport rebuild.
+        self._registered_kv_caches = dict(kv_caches)
 
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
@@ -1402,6 +1405,10 @@ class NixlBaseConnectorWorker:
         """Hook for push mode's additional NIXL thread."""
         return None
 
+    def _discard_push_work_for_lifecycle(self) -> None:
+        """Discard connector-specific work that has not created a handle."""
+        return None
+
     def _publish_handshake_metadata(self) -> None:
         """Tell the scheduler about the fresh agent metadata after rebuild."""
         if self.xfer_handshake_metadata is None:
@@ -1426,7 +1433,7 @@ class NixlBaseConnectorWorker:
                 sock.send(msg)
                 sock.recv()
         except Exception as exc:
-            logger.warning("Could not publish refreshed NIXL metadata: %s", exc)
+            raise RuntimeError("Could not publish refreshed NIXL metadata") from exc
 
     def _release_transport_state(self) -> None:
         """Release NIXL state while retaining connector configuration and caches."""
@@ -1481,6 +1488,8 @@ class NixlBaseConnectorWorker:
     def quiesce(self, timeout: float | None = None) -> None:
         """Drain transfers and release NIXL state without losing KV tensors."""
         self._stop_push_writer_for_lifecycle()
+        self._stop_handshake_executor()
+        self._discard_push_work_for_lifecycle()
         timeout = timeout if timeout is not None else 30.0
         deadline = time.monotonic() + timeout
         transfer_maps = [self._recving_transfers]
