@@ -2396,6 +2396,78 @@ def test_publish_handshake_metadata_propagates_failures():
 # ── TTL-based remote engine eviction tests ──────────────────────────
 
 
+def test_reinitialize_rebuilds_transport_from_retained_caches():
+    """Reinitialization replaces transport state without replacing KV tensors."""
+    worker = object.__new__(NixlConnectorWorker)
+    worker.shutdown = MagicMock()
+    caches = {"layer": MagicMock()}
+    replacement = MagicMock()
+    worker._registered_kv_caches = caches
+    worker._nixl_wrapper_cls = MagicMock(return_value=replacement)
+    worker._nixl_config = MagicMock()
+    worker.quiesce = MagicMock()
+    worker._new_handshake_executor = MagicMock()
+    worker.register_kv_caches = MagicMock()
+    worker._publish_handshake_metadata = MagicMock()
+
+    worker.reinitialize()
+
+    assert worker.nixl_wrapper is replacement
+    worker.quiesce.assert_called_once_with()
+    worker._new_handshake_executor.assert_called_once_with()
+    worker.register_kv_caches.assert_called_once_with(caches)
+    worker._publish_handshake_metadata.assert_called_once_with()
+
+
+def test_reinitialize_releases_replacement_state_on_failure():
+    """A failed rebuild must release the newly-created transport state."""
+    worker = object.__new__(NixlConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker._registered_kv_caches = {"layer": MagicMock()}
+    worker._nixl_wrapper_cls = MagicMock(return_value=MagicMock())
+    worker._nixl_config = MagicMock()
+    worker.quiesce = MagicMock()
+    worker._new_handshake_executor = MagicMock()
+    worker.register_kv_caches = MagicMock(side_effect=RuntimeError("register"))
+    worker._release_transport_state = MagicMock()
+
+    with pytest.raises(RuntimeError, match="register"):
+        worker.reinitialize()
+
+    worker._release_transport_state.assert_called_once_with()
+
+
+@pytest.mark.parametrize("state, error", [("ERROR", RuntimeError), ("PROC", TimeoutError)])
+def test_quiesce_rejects_failed_or_timed_out_transfers(state, error):
+    """Transport state remains intact when a transfer cannot be drained."""
+    worker = object.__new__(NixlConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker._recving_transfers = {"request": [1]}
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.check_xfer_state.return_value = state
+    worker._stop_push_writer_for_lifecycle = MagicMock()
+    worker._stop_handshake_executor = MagicMock()
+    worker._discard_push_work_for_lifecycle = MagicMock()
+    worker._release_transport_state = MagicMock()
+
+    with pytest.raises(error):
+        worker.quiesce(timeout=0)
+
+    worker._release_transport_state.assert_not_called()
+
+
+def test_scheduler_metadata_replacement_updates_one_worker_payload():
+    """A lifecycle refresh replaces the metadata served for one worker."""
+    scheduler = object.__new__(NixlConnectorScheduler)
+    scheduler._handshake_metadata_lock = threading.Lock()
+    scheduler._encoded_handshake_data = {(0, 0): b"old"}
+    payload = NixlHandshakePayload(b"compat", b"new-agent")
+
+    scheduler.update_xfer_handshake_metadata(0, 0, payload)
+
+    assert scheduler._encoded_handshake_data[(0, 0)] == msgspec.msgpack.encode(payload)
+
+
 def _setup_worker_with_remote_engine(
     engine_ttl: float = 10.0,
 ) -> tuple[Any, str]:

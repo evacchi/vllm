@@ -193,6 +193,21 @@ def _compare_directories(dir1: Path, dir2: Path) -> bool:
     return True
 
 
+def test_multi_connector_forwards_lifecycle_hooks(mc):
+    """Lifecycle operations reach every configured child connector."""
+    children = [MagicMock(), MagicMock()]
+    mc._connectors = children
+
+    mc.quiesce(12.0)
+    mc.reinitialize()
+    mc.verify()
+
+    for child in children:
+        child.quiesce.assert_called_once_with(12.0)
+        child.reinitialize.assert_called_once_with()
+        child.verify.assert_called_once_with()
+
+
 def test_multi_example_connector_consistency():
     """
     Tests that MultiConnector with two ExampleConnectors saves
