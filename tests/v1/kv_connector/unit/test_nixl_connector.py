@@ -22,8 +22,14 @@ import ray
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from tests.utils import ensure_current_vllm_config
 from vllm import LLM
 from vllm.config import KVTransferConfig, set_current_vllm_config
+from vllm.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
     KVOutputAggregator,
@@ -98,6 +104,28 @@ def clear_kv_transfer():
     yield
     if has_kv_transfer_group():
         ensure_kv_transfer_shutdown()
+
+
+@pytest.fixture
+def gloo_dist_init():
+    """Initialize a CPU process group for NIXL resource-cleanup tests."""
+    fd, temp_file = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        with ensure_current_vllm_config():
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                distributed_init_method=f"file://{temp_file}",
+                local_rank=0,
+                backend="gloo",
+            )
+            initialize_model_parallel(1, 1)
+            yield
+        cleanup_dist_env_and_memory()
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_file)
 
 
 def get_default_xfer_telemetry(
@@ -2190,7 +2218,7 @@ def test_kv_buffer_to_nixl_memory_types(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FakeNixlWrapper,
 )
-def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
+def test_shutdown_cleans_up_resources(default_vllm_config, gloo_dist_init):
     """Test that shutdown() properly cleans up all resources."""
     vllm_config = create_vllm_config()
 
