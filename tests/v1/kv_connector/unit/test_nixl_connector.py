@@ -7,6 +7,7 @@ import os
 import queue
 import tempfile
 import textwrap
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -2260,7 +2261,7 @@ def test_release_transport_state_retains_registered_cache_mapping():
     worker = object.__new__(NixlConnectorWorker)
     caches = {"layer": MagicMock()}
     worker._registered_kv_caches = dict(caches)
-    worker.device_kv_caches = worker._registered_kv_caches
+    worker.device_kv_caches = dict(caches)
     worker.host_xfer_buffers = {}
     worker._handshake_initiation_executor = None
     worker._recving_transfers = {}
