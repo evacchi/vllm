@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import ray
 import torch
+import zmq
 
 from tests.v1.attention.utils import dense_kv_cache_views
 from tests.utils import ensure_current_vllm_config
