@@ -53,6 +53,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPushConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    GET_META_MSG,
+    UPDATE_META_MSG,
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_transfer_state import (
@@ -2264,7 +2266,7 @@ def test_shutdown_cleans_up_resources(default_vllm_config, gloo_dist_init):
         worker.shutdown()
         worker.shutdown()
 
-        mock_exec.shutdown.assert_called_with(wait=True, cancel_futures=True)
+        mock_exec.shutdown.assert_called_with(wait=False, cancel_futures=True)
 
         # Same sequence on scheduler.shutdown()
         scheduler.shutdown()
@@ -2466,6 +2468,119 @@ def test_scheduler_metadata_replacement_updates_one_worker_payload():
     scheduler.update_xfer_handshake_metadata(0, 0, payload)
 
     assert scheduler._encoded_handshake_data[(0, 0)] == msgspec.msgpack.encode(payload)
+
+
+@pytest.mark.parametrize(
+    "request",
+    [
+        (UPDATE_META_MSG, 0, 0),
+        (GET_META_MSG, 0, 0),
+    ],
+)
+def test_scheduler_metadata_listener_replies_immediately_to_invalid_requests(request):
+    """Invalid or missing metadata must produce an error reply, not a timeout."""
+
+    class FakeSocket:
+        def __init__(self):
+            self.replies = []
+
+        def setsockopt(self, *_args):
+            pass
+
+        def recv_multipart(self):
+            if self.replies:
+                raise zmq.Again
+            self.replies.append(None)
+            return [b"client", b"", msgspec.msgpack.encode(request)]
+
+        def send_multipart(self, reply):
+            self.replies.append(reply)
+
+    class FakeContext:
+        def __init__(self, socket):
+            self.socket = socket
+
+        def __enter__(self):
+            return self.socket
+
+        def __exit__(self, *_args):
+            pass
+
+    socket = FakeSocket()
+    stop_event = threading.Event()
+    stop_event.set()
+    scheduler = object.__new__(NixlConnectorScheduler)
+    scheduler._handshake_metadata_lock = threading.Lock()
+    scheduler._encoded_handshake_data = {}
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler.zmq_ctx",
+        return_value=FakeContext(socket),
+    ):
+        scheduler._nixl_handshake_listener(
+            threading.Event(), stop_event, "localhost", 1234
+        )
+
+    assert socket.replies[-1] == (b"client", b"", b"error", b"")
+
+
+def test_scheduler_metadata_listener_reads_without_metadata_lock():
+    """The hot GET metadata path must not serialize on the update lock."""
+
+    class LockThatMustNotBeAcquired:
+        def __enter__(self):
+            raise AssertionError("GET metadata acquired the update lock")
+
+        def __exit__(self, *_args):
+            pass
+
+    class FakeSocket:
+        def __init__(self):
+            self.replies = []
+            self.received = False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def recv_multipart(self):
+            if self.received:
+                raise zmq.Again
+            self.received = True
+            return [
+                b"client",
+                b"",
+                msgspec.msgpack.encode((GET_META_MSG, 0, 0)),
+            ]
+
+        def send_multipart(self, reply):
+            self.replies.append(reply)
+
+    class FakeContext:
+        def __init__(self, socket):
+            self.socket = socket
+
+        def __enter__(self):
+            return self.socket
+
+        def __exit__(self, *_args):
+            pass
+
+    socket = FakeSocket()
+    stop_event = threading.Event()
+    stop_event.set()
+    scheduler = object.__new__(NixlConnectorScheduler)
+    scheduler._handshake_metadata_lock = LockThatMustNotBeAcquired()
+    scheduler._encoded_handshake_data = {(0, 0): b"metadata"}
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler.zmq_ctx",
+        return_value=FakeContext(socket),
+    ):
+        scheduler._nixl_handshake_listener(
+            threading.Event(), stop_event, "localhost", 1234
+        )
+
+    assert socket.replies[-1][2] == b"metadata"
 
 
 def _setup_worker_with_remote_engine(

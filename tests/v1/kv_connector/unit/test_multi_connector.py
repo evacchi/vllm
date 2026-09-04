@@ -3,9 +3,10 @@
 import filecmp
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -203,9 +204,54 @@ def test_multi_connector_forwards_lifecycle_hooks(mc):
     mc.verify()
 
     for child in children:
-        child.quiesce.assert_called_once_with(12.0)
+        assert child.quiesce.call_count == 1
+        assert child.quiesce.call_args.args[0] <= 12.0
         child.reinitialize.assert_called_once_with()
         child.verify.assert_called_once_with()
+
+
+def test_multi_connector_quiesce_uses_one_shared_deadline(mc):
+    children = [MagicMock(), MagicMock(), MagicMock()]
+    mc._connectors = children
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector.time.monotonic",
+        side_effect=[100.0, 102.0, 106.0, 111.0],
+    ):
+        mc.quiesce(10.0)
+
+    assert [c.quiesce.call_args.args[0] for c in children] == [8.0, 4.0, 0.0]
+
+
+def test_multi_connector_reinitialize_quiesces_completed_children_on_failure(mc):
+    first, second = MagicMock(), MagicMock()
+    second.reinitialize.side_effect = RuntimeError("reinitialize failed")
+    mc._connectors = [first, second]
+
+    with pytest.raises(RuntimeError, match="reinitialize failed"):
+        mc.reinitialize()
+
+    first.reinitialize.assert_called_once_with()
+    first.quiesce.assert_called_once_with()
+    second.reinitialize.assert_called_once_with()
+
+
+def test_multi_connector_reinitializes_children_in_parallel(mc):
+    """Independent child transports are rebuilt concurrently."""
+    entered = threading.Barrier(2)
+    children = [MagicMock(), MagicMock()]
+
+    def reinitialize():
+        entered.wait(timeout=1)
+
+    for child in children:
+        child.reinitialize.side_effect = reinitialize
+    mc._connectors = children
+
+    mc.reinitialize()
+
+    for child in children:
+        child.reinitialize.assert_called_once_with()
 
 
 def test_multi_example_connector_consistency():

@@ -348,9 +348,9 @@ class NixlBaseConnectorScheduler:
         if not isinstance(metadata, NixlHandshakePayload):
             raise ValueError("NIXL metadata update expects NixlHandshakePayload")
         with self._handshake_metadata_lock:
-            self._encoded_handshake_data[(pp_rank, tp_rank)] = msgspec.msgpack.encode(
-                metadata
-            )
+            encoded_data = self._encoded_handshake_data.copy()
+            encoded_data[(pp_rank, tp_rank)] = msgspec.msgpack.encode(metadata)
+            self._encoded_handshake_data = encoded_data
 
     def _nixl_handshake_listener(
         self,
@@ -391,6 +391,7 @@ class NixlBaseConnectorScheduler:
                 if msg == UPDATE_META_MSG:
                     if len(decoded) != 4:
                         logger.warning("Invalid NIXL metadata update message")
+                        sock.send_multipart((identity, b"", b"error", b""))
                         continue
                     if metadata is not None:
                         metadata[(target_pp_rank, target_tp_rank)] = decoded[3]
@@ -411,16 +412,16 @@ class NixlBaseConnectorScheduler:
                 if metadata is not None:
                     payload = metadata.get((target_pp_rank, target_tp_rank))
                 else:
-                    with metadata_lock:
-                        payload = self._encoded_handshake_data.get(
-                            (target_pp_rank, target_tp_rank)
-                        )
+                    payload = self._encoded_handshake_data.get(
+                        (target_pp_rank, target_tp_rank)
+                    )
                 if payload is None:
                     logger.warning(
                         "No NIXL metadata for PP rank %s, TP rank %s",
                         target_pp_rank,
                         target_tp_rank,
                     )
+                    sock.send_multipart((identity, b"", b"error", b""))
                     continue
                 sock.send_multipart((identity, b"", payload, ts))
 

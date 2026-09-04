@@ -777,6 +777,11 @@ class NixlBaseConnectorWorker:
                 reply_parts = sock.recv_multipart()
                 recv_time = time.perf_counter()
                 assert len(reply_parts) == 2
+                if reply_parts[0] == b"error":
+                    raise RuntimeError(
+                        "Remote NIXL scheduler has no metadata for "
+                        f"PP rank {remote_pp_rank}, TP rank {remote_rank}"
+                    )
                 handshake_bytes = reply_parts[0]
 
                 remote_perf = msgspec.msgpack.decode(reply_parts[1])
@@ -1398,7 +1403,7 @@ class NixlBaseConnectorWorker:
         """Stop handshake work so no operation can use a retired agent."""
         executor = getattr(self, "_handshake_initiation_executor", None)
         if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
             self._handshake_initiation_executor = None
 
     def _stop_push_writer_for_lifecycle(self) -> None:
@@ -1431,7 +1436,8 @@ class NixlBaseConnectorWorker:
                     )
                 )
                 sock.send(msg)
-                sock.recv()
+                if sock.recv() != b"ok":
+                    raise RuntimeError("NIXL scheduler rejected metadata update")
         except Exception as exc:
             raise RuntimeError("Could not publish refreshed NIXL metadata") from exc
 
