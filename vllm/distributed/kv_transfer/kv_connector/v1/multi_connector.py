@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -465,6 +467,50 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             if metadata is not None:
                 return metadata
         return None
+
+    def quiesce(self, timeout: float | None = None) -> None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for connector in self._connectors:
+            remaining = None
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+            connector.quiesce(remaining)
+
+    def reinitialize(self) -> None:
+        if not self._connectors:
+            return
+        reinitialized = []
+        first_error: BaseException | None = None
+        first_traceback = None
+        with ThreadPoolExecutor(max_workers=len(self._connectors)) as executor:
+            futures = [
+                (connector, executor.submit(connector.reinitialize))
+                for connector in self._connectors
+            ]
+            for connector, future in futures:
+                try:
+                    future.result()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                        first_traceback = exc.__traceback__
+                else:
+                    reinitialized.append(connector)
+
+        if first_error is not None:
+            # A child may have rebuilt its transport before a later child
+            # failed. Quiesce completed children so the wrapper does not keep
+            # a mixture of live and retired child transports.
+            for connector in reinitialized:
+                try:
+                    connector.quiesce()
+                except Exception:
+                    logger.exception("Failed to roll back connector reinitialize")
+            raise first_error.with_traceback(first_traceback)
+
+    def verify(self) -> None:
+        for connector in self._connectors:
+            connector.verify()
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]

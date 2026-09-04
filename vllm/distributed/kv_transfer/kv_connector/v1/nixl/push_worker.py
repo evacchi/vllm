@@ -130,7 +130,34 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     # --- Lifecycle ----------------------------------------------------- #
 
+    def _stop_push_writer_for_lifecycle(self):
+        self._push_writer_stop.set()
+        self._push_writer_wake.set()
+        if self._push_writer_thread is not None:
+            self._push_writer_thread.join(timeout=2)
+            if self._push_writer_thread.is_alive():
+                raise RuntimeError("NIXL push writer did not stop")
+            self._push_writer_thread = None
+
+    @staticmethod
+    def _clear_queue(work_queue):
+        while True:
+            try:
+                work_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _discard_push_work_for_lifecycle(self):
+        self._clear_queue(self._reg_send_inbox)
+        self._clear_queue(self._finished_blocks_inbox)
+        self._clear_queue(self._deferred_push_inbox)
+        self._clear_queue(self._pending_completion_notifs)
+        self._clear_queue(self._evict_finished_inbox)
+        self._push_finished_blocks.clear()
+        self._pending_d_registrations.clear()
+
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
+        self._push_writer_stop.clear()
         super().register_kv_caches(kv_caches)
         if self._push_writer_thread is None:
             self._push_writer_thread = threading.Thread(

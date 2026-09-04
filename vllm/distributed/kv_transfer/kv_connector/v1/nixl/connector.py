@@ -312,6 +312,18 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
 
+    def quiesce(self, timeout: float | None = None) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.quiesce(timeout)
+
+    def reinitialize(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.reinitialize()
+
+    def verify(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.verify()
+
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """
         Get the KVConnector handshake metadata for this connector.

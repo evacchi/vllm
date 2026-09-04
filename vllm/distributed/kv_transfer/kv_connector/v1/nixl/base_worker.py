@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import zmq
 
+from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -37,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
+    UPDATE_META_MSG,
     ReqId,
     ReqMeta,
     TransferHandle,
@@ -63,6 +65,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
     get_pcp_group,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -425,6 +428,8 @@ class NixlBaseConnectorWorker:
                 else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
             )
 
+        self._nixl_wrapper_cls = nixl_wrapper_cls
+        self._nixl_config = config
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
@@ -464,6 +469,7 @@ class NixlBaseConnectorWorker:
                 "is not supported."
             )
         self.device_kv_caches: dict[str, torch.Tensor] = {}
+        self._registered_kv_caches: dict[str, torch.Tensor] = {}
 
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
@@ -519,6 +525,7 @@ class NixlBaseConnectorWorker:
         # PP>1 (push mode): this worker holds a contiguous layer slice and
         # transfers into the matching sub-range of a PP=1 remote's regions.
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        self.pp_rank = get_pp_group().rank_in_group if self.pp_size > 1 else 0
         self._remote_region_offset = 0
         # PP push slices regions per layer (uniform count); HMA breaks that.
         if self.pp_size > 1 and self._is_hma_required:
@@ -772,6 +779,11 @@ class NixlBaseConnectorWorker:
                 reply_parts = sock.recv_multipart()
                 recv_time = time.perf_counter()
                 assert len(reply_parts) == 2
+                if reply_parts[0] == b"error":
+                    raise RuntimeError(
+                        "Remote NIXL scheduler has no metadata for "
+                        f"PP rank {remote_pp_rank}, TP rank {remote_rank}"
+                    )
                 handshake_bytes = reply_parts[0]
 
                 remote_perf = msgspec.msgpack.decode(reply_parts[1])
@@ -1088,6 +1100,11 @@ class NixlBaseConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
+        # Keep an independent mapping: device_kv_caches is cleared when the
+        # transport is released, but the tensors must remain available for a
+        # later transport rebuild.
+        self._registered_kv_caches = dict(kv_caches)
+
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
@@ -1383,6 +1400,161 @@ class NixlBaseConnectorWorker:
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
+
+    def _stop_handshake_executor(self) -> None:
+        """Stop handshake work so no operation can use a retired agent."""
+        executor = getattr(self, "_handshake_initiation_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._handshake_initiation_executor = None
+
+    def _stop_push_writer_for_lifecycle(self) -> None:
+        """Hook for push mode's additional NIXL thread."""
+        return None
+
+    def _discard_push_work_for_lifecycle(self) -> None:
+        """Discard connector-specific work that has not created a handle."""
+        return None
+
+    def _publish_handshake_metadata(self) -> None:
+        """Tell the scheduler about the fresh agent metadata after rebuild."""
+        if self.xfer_handshake_metadata is None:
+            return
+        port = (
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            + self.vllm_config.parallel_config.data_parallel_index
+        )
+        pp_rank = getattr(self, "pp_rank", 0)
+        path = make_zmq_path("tcp", envs.VLLM_NIXL_SIDE_CHANNEL_HOST, port)
+        try:
+            with zmq_ctx(zmq.REQ, path) as sock:
+                sock.setsockopt(zmq.RCVTIMEO, 2000)
+                msg = msgspec.msgpack.encode(
+                    (
+                        UPDATE_META_MSG,
+                        pp_rank,
+                        self.tp_rank,
+                        msgspec.msgpack.encode(self.xfer_handshake_metadata),
+                    )
+                )
+                sock.send(msg)
+                if sock.recv() != b"ok":
+                    raise RuntimeError("NIXL scheduler rejected metadata update")
+        except Exception as exc:
+            raise RuntimeError("Could not publish refreshed NIXL metadata") from exc
+
+    def _release_transport_state(self) -> None:
+        """Release NIXL state while retaining connector configuration and caches."""
+        self._stop_handshake_executor()
+        for handles in self._recving_transfers.values():
+            for handle in handles:
+                self.nixl_wrapper.release_xfer_handle(handle)
+        self._recving_transfers.clear()
+        for handles in getattr(self, "_sending_transfers", {}).values():
+            for handle in handles:
+                self.nixl_wrapper.release_xfer_handle(handle)
+        if hasattr(self, "_sending_transfers"):
+            self._sending_transfers.clear()
+        for handle in self.src_xfer_handles_by_block_size.values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        for handles in self.src_xfer_handles_by_tp_ratio.values():
+            for handle in handles:
+                self.nixl_wrapper.release_dlist_handle(handle)
+        for engine_id in list(self._remote_agents):
+            self._cleanup_remote_engine(engine_id, log_eviction=False)
+        for desc in self._registered_descs:
+            self.nixl_wrapper.deregister_memory(desc)
+
+        self.src_xfer_handles_by_block_size.clear()
+        self.src_xfer_handles_by_tp_ratio.clear()
+        self._registered_descs.clear()
+        self._remote_agents.clear()
+        self._engine_clock_offset.clear()
+        self.kv_caches_base_addr.clear()
+        self.dst_xfer_side_handles.clear()
+        self.dst_num_blocks.clear()
+        self._handshake_futures.clear()
+        self._engine_last_active.clear()
+        self.device_kv_caches.clear()
+        self.host_xfer_buffers.clear()
+        self.xfer_handshake_metadata = None
+        self.compat_hash = None
+        self.transfer_topo = None
+        self.num_regions = 0
+        self.block_len_per_layer.clear()
+        self.block_stride_per_layer.clear()
+        self._region_is_mla.clear()
+        self._ssm_region_indices.clear()
+        self._scratch_region_indices.clear()
+        self._ple_region_index = None
+
+    def _new_handshake_executor(self) -> None:
+        self._handshake_initiation_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vllm-nixl-handshake-initiator"
+        )
+
+    def quiesce(self, timeout: float | None = None) -> None:
+        """Drain transfers and release NIXL state without losing KV tensors."""
+        self._stop_push_writer_for_lifecycle()
+        self._stop_handshake_executor()
+        self._discard_push_work_for_lifecycle()
+        timeout = timeout if timeout is not None else 30.0
+        deadline = time.monotonic() + timeout
+        transfer_maps = [self._recving_transfers]
+        if hasattr(self, "_sending_transfers"):
+            transfer_maps.append(self._sending_transfers)
+        while any(transfer_maps):
+            pending = False
+            for transfers in transfer_maps:
+                for handles in list(transfers.values()):
+                    for handle in handles:
+                        state = self.nixl_wrapper.check_xfer_state(handle)
+                        if state == "PROC":
+                            pending = True
+                        elif state != "DONE":
+                            raise RuntimeError(
+                                "NIXL transfer failed while quiescing: "
+                                f"{state}"
+                            )
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out draining NIXL transfers")
+            time.sleep(0.01)
+        self._release_transport_state()
+
+    def reinitialize(self) -> None:
+        """Create a fresh NIXL agent and register the retained KV caches."""
+        if not self._registered_kv_caches:
+            raise RuntimeError(
+                "Cannot reinitialize NIXL before KV caches are registered"
+            )
+        self.quiesce()
+        self.nixl_wrapper = self._nixl_wrapper_cls(
+            str(uuid.uuid4()), self._nixl_config
+        )
+        self._new_handshake_executor()
+        try:
+            self.register_kv_caches(self._registered_kv_caches)
+            self._publish_handshake_metadata()
+        except Exception:
+            self._release_transport_state()
+            raise
+
+    def verify(self) -> None:
+        """Verify the agent, handshake payload, and local registrations exist."""
+        if getattr(self, "nixl_wrapper", None) is None:
+            raise RuntimeError("NIXL agent is not initialized")
+        try:
+            agent_metadata = self.nixl_wrapper.get_agent_metadata()
+        except Exception as exc:
+            raise RuntimeError("NIXL agent is not usable") from exc
+        if not agent_metadata:
+            raise RuntimeError("NIXL agent returned empty metadata")
+        if self.xfer_handshake_metadata is None or self.compat_hash is None:
+            raise RuntimeError("NIXL handshake metadata is not initialized")
+        if not self._registered_descs or not self.device_kv_caches:
+            raise RuntimeError("NIXL KV cache memory is not registered")
 
     def _build_mamba_local(self, base_addresses: list[int]) -> np.ndarray:
         """Build desc regions (conv sub-projections + ssm) per layer for
@@ -2803,7 +2975,8 @@ class NixlBaseConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
-        self._handshake_initiation_executor.shutdown(wait=False)
+        self._stop_push_writer_for_lifecycle()
+        self._stop_handshake_executor()
         for handles in self._recving_transfers.values():
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
