@@ -254,6 +254,30 @@ def test_multi_connector_reinitializes_children_in_parallel(mc):
         child.reinitialize.assert_called_once_with()
 
 
+def test_multi_connector_rolls_back_all_successful_children(mc):
+    """Every child rebuilt before a failure is quiesced during rollback."""
+    first, second, third = MagicMock(), MagicMock(), MagicMock()
+    third.reinitialize.side_effect = RuntimeError("reinitialize failed")
+    mc._connectors = [first, second, third]
+
+    with pytest.raises(RuntimeError, match="reinitialize failed"):
+        mc.reinitialize()
+
+    first.quiesce.assert_called_once_with()
+    second.quiesce.assert_called_once_with()
+
+
+def test_multi_connector_preserves_reinitialize_error_if_rollback_fails(mc):
+    """A rollback failure must not hide the original child failure."""
+    first, second = MagicMock(), MagicMock()
+    first.quiesce.side_effect = RuntimeError("rollback failed")
+    second.reinitialize.side_effect = RuntimeError("reinitialize failed")
+    mc._connectors = [first, second]
+
+    with pytest.raises(RuntimeError, match="reinitialize failed"):
+        mc.reinitialize()
+
+
 def test_multi_example_connector_consistency():
     """
     Tests that MultiConnector with two ExampleConnectors saves
