@@ -2471,13 +2471,13 @@ def test_scheduler_metadata_replacement_updates_one_worker_payload():
 
 
 @pytest.mark.parametrize(
-    "request",
+    "request_data",
     [
         (UPDATE_META_MSG, 0, 0),
         (GET_META_MSG, 0, 0),
     ],
 )
-def test_scheduler_metadata_listener_replies_immediately_to_invalid_requests(request):
+def test_scheduler_metadata_listener_replies_immediately_to_invalid_requests(request_data):
     """Invalid or missing metadata must produce an error reply, not a timeout."""
 
     class FakeSocket:
@@ -2491,7 +2491,7 @@ def test_scheduler_metadata_listener_replies_immediately_to_invalid_requests(req
             if self.replies:
                 raise zmq.Again
             self.replies.append(None)
-            return [b"client", b"", msgspec.msgpack.encode(request)]
+            return [b"client", b"", msgspec.msgpack.encode(request_data)]
 
         def send_multipart(self, reply):
             self.replies.append(reply)
