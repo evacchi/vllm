@@ -316,6 +316,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is not None:
             self.connector_worker.quiesce(timeout)
 
+    def release_for_checkpoint(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.release_for_checkpoint()
+
     def reinitialize(self) -> None:
         if self.connector_worker is not None:
             self.connector_worker.reinitialize()

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base worker-side logic for the NIXL connector."""
 
+import gc
 import itertools
 import logging
 import os
@@ -1524,13 +1525,21 @@ class NixlBaseConnectorWorker:
             time.sleep(0.01)
         self._release_transport_state()
 
+    def release_for_checkpoint(self) -> None:
+        """Release device-backed NIXL mappings after quiescing for CRIU."""
+        self.nixl_wrapper = None
+        gc.collect()
+
     def reinitialize(self) -> None:
         """Create a fresh NIXL agent and register the retained KV caches."""
         if not self._registered_kv_caches:
             raise RuntimeError(
                 "Cannot reinitialize NIXL before KV caches are registered"
             )
-        self.quiesce()
+        # Snapshot lifecycle may have already quiesced and dropped the wrapper
+        # to release device-backed RDMA mappings before CRIU.
+        if self.nixl_wrapper is not None:
+            self.quiesce()
         self.nixl_wrapper = self._nixl_wrapper_cls(
             str(uuid.uuid4()), self._nixl_config
         )
