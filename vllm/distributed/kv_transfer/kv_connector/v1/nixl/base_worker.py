@@ -1501,6 +1501,9 @@ class NixlBaseConnectorWorker:
         transfer_maps = [self._recving_transfers]
         if hasattr(self, "_sending_transfers"):
             transfer_maps.append(self._sending_transfers)
+        # NIXL 1.3.2 exposes transfer state and notification polling, but no
+        # blocking completion wait or event handle. Keep this polling loop
+        # until the binding provides an event-driven completion primitive.
         while any(transfer_maps):
             pending = False
             for transfers in transfer_maps:
