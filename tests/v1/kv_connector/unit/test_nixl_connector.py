@@ -2455,7 +2455,7 @@ def test_reinitialize_rebuilds_transport_from_retained_caches():
     worker.reinitialize()
 
     assert worker.nixl_wrapper is replacement
-    worker.quiesce.assert_called_once_with()
+    worker.quiesce.assert_not_called()
     worker._new_handshake_executor.assert_called_once_with()
     worker.register_kv_caches.assert_called_once_with(caches)
     worker._publish_handshake_metadata.assert_called_once_with()
