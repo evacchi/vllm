@@ -7,6 +7,7 @@ import itertools
 import logging
 import os
 import queue
+import socket
 import threading
 import time
 import uuid
@@ -1424,7 +1425,11 @@ class NixlBaseConnectorWorker:
             + self.vllm_config.parallel_config.data_parallel_index
         )
         pp_rank = getattr(self, "pp_rank", 0)
-        path = make_zmq_path("tcp", envs.VLLM_NIXL_SIDE_CHANNEL_HOST, port)
+        # CRIU restores the process environment verbatim, so the pod-IP
+        # downward API value may refer to the pre-checkpoint pod. Resolve the
+        # current pod address when publishing refreshed metadata.
+        host = socket.gethostbyname(socket.gethostname())
+        path = make_zmq_path("tcp", host, port)
         try:
             with zmq_ctx(zmq.REQ, path) as sock:
                 sock.setsockopt(zmq.RCVTIMEO, 2000)
