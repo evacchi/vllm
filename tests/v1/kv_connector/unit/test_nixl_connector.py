@@ -2440,6 +2440,7 @@ def test_publish_handshake_metadata_rejects_non_ok_reply(reply):
 def test_reinitialize_rebuilds_transport_from_retained_caches():
     """Reinitialization replaces transport state without replacing KV tensors."""
     worker = object.__new__(NixlConnectorWorker)
+    worker.nixl_wrapper = None
     worker.shutdown = MagicMock()
     caches = {"layer": MagicMock()}
     replacement = MagicMock()
@@ -2463,6 +2464,7 @@ def test_reinitialize_rebuilds_transport_from_retained_caches():
 def test_reinitialize_releases_replacement_state_on_failure():
     """A failed rebuild must release the newly-created transport state."""
     worker = object.__new__(NixlConnectorWorker)
+    worker.nixl_wrapper = None
     worker.shutdown = MagicMock()
     worker._registered_kv_caches = {"layer": MagicMock()}
     worker._nixl_wrapper_cls = MagicMock(return_value=MagicMock())
