@@ -322,6 +322,8 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
 
     def reinitialize(self) -> None:
         if self.connector_worker is not None:
+            if self.connector_scheduler is not None:
+                self.connector_scheduler.refresh_handshake_endpoint()
             self.connector_worker.reinitialize()
 
     def verify(self) -> None:

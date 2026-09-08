@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base scheduler-side logic for the NIXL connector."""
 
+import socket
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -340,6 +341,30 @@ class NixlBaseConnectorScheduler:
             )
             self._nixl_handshake_listener_t.start()
             ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+
+    def refresh_handshake_endpoint(self) -> None:
+        """Rebind the handshake listener after a pod IP changes."""
+        host = socket.gethostbyname(socket.gethostname())
+        if host == self.side_channel_host:
+            return
+        listener = self._nixl_handshake_listener_t
+        if listener is not None:
+            self._stop_event.set()
+            listener.join(timeout=5.0)
+        self.side_channel_host = host
+        self._stop_event = threading.Event()
+        self._nixl_handshake_listener_t = None
+        if not self._encoded_handshake_data:
+            return
+        ready_event = threading.Event()
+        self._nixl_handshake_listener_t = threading.Thread(
+            target=self._nixl_handshake_listener,
+            args=(ready_event, self._stop_event, self.side_channel_host, self.side_channel_port),
+            daemon=True,
+            name="nixl_handshake_listener",
+        )
+        self._nixl_handshake_listener_t.start()
+        ready_event.wait()
 
     def update_xfer_handshake_metadata(
         self, pp_rank: int, tp_rank: int, metadata: NixlHandshakePayload
