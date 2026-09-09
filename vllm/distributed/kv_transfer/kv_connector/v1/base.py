@@ -404,6 +404,10 @@ class KVConnectorBase_V1(ABC):
         del timeout
         return None
 
+    def release_for_checkpoint(self) -> None:
+        """Release resources that cannot cross a checkpoint boundary."""
+        return None
+
     def reinitialize(self) -> None:
         """Rebuild connector-owned transport state while retaining KV caches."""
         return None

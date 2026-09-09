@@ -37,10 +37,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    UPDATE_META_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
-    UPDATE_META_MSG,
     ReqId,
     ReqMeta,
     TransferHandle,
@@ -588,6 +588,7 @@ class NixlBaseConnectorWorker:
         ] = {}
         # Protects _handshake_futures and _remote_agents.
         self._handshake_lock = threading.RLock()
+        self._checkpoint_quiescing = False
 
         # TTL-based eviction of stale remote engine state.
         self._engine_last_active: dict[EngineId, float] = {}
@@ -1022,6 +1023,8 @@ class NixlBaseConnectorWorker:
         returned future.
         Failures to handshake are logged and the request is marked as failed.
         """
+        if self._checkpoint_quiescing:
+            raise RuntimeError("NIXL connector is quiescing for checkpoint")
         self._evict_stale_engines()
         with self._handshake_lock:
             if engine_id in self._remote_agents:
@@ -1405,7 +1408,7 @@ class NixlBaseConnectorWorker:
         """Stop handshake work so no operation can use a retired agent."""
         executor = getattr(self, "_handshake_initiation_executor", None)
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
             self._handshake_initiation_executor = None
 
     def _stop_push_writer_for_lifecycle(self) -> None:
@@ -1492,6 +1495,50 @@ class NixlBaseConnectorWorker:
         self._scratch_region_indices.clear()
         self._ple_region_index = None
 
+    def _pending_lifecycle_work(self) -> tuple[str, ...]:
+        """Return connector state that must be empty before checkpointing."""
+
+        def pending(name: str) -> bool:
+            value = getattr(self, name, None)
+            if value is None:
+                return False
+            empty = getattr(value, "empty", None)
+            return not empty() if callable(empty) else bool(value)
+
+        names = (
+            "_recving_transfers",
+            "_recving_metadata",
+            "_reqs_to_send",
+            "_reqs_to_process",
+            "consumer_notification_counts_by_req",
+            "expected_consumer_notifications_by_req",
+            "_handshake_futures",
+            "_ready_requests",
+            "_sending_transfers",
+            "_push_finished_blocks",
+            "_pending_d_registrations",
+            "_reg_send_inbox",
+            "_finished_blocks_inbox",
+            "_pending_completion_notifs",
+            "_evict_finished_inbox",
+            "_deferred_push_inbox",
+        )
+        return tuple(name for name in names if pending(name))
+
+    def _refresh_local_scheduler_endpoint(self) -> None:
+        """Refresh the scheduler listener that shares this EngineCore process."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+            get_local_nixl_scheduler,
+        )
+
+        scheduler = get_local_nixl_scheduler(self.engine_id)
+        if scheduler is None:
+            raise RuntimeError(
+                "NIXL checkpoint reinitialize requires a scheduler connector "
+                "in the local EngineCore process"
+            )
+        scheduler.refresh_handshake_endpoint()
+
     def _new_handshake_executor(self) -> None:
         self._handshake_initiation_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="vllm-nixl-handshake-initiator"
@@ -1499,35 +1546,26 @@ class NixlBaseConnectorWorker:
 
     def quiesce(self, timeout: float | None = None) -> None:
         """Drain transfers and release NIXL state without losing KV tensors."""
-        self._stop_push_writer_for_lifecycle()
-        self._stop_handshake_executor()
-        self._discard_push_work_for_lifecycle()
+        self._checkpoint_quiescing = True
         timeout = timeout if timeout is not None else 30.0
         deadline = time.monotonic() + timeout
-        transfer_maps = [self._recving_transfers]
-        if hasattr(self, "_sending_transfers"):
-            transfer_maps.append(self._sending_transfers)
-        # NIXL 1.3.2 exposes transfer state and notification polling, but no
-        # blocking completion wait or event handle. Keep this polling loop
-        # until the binding provides an event-driven completion primitive.
-        while any(transfer_maps):
-            pending = False
-            for transfers in transfer_maps:
-                for handles in list(transfers.values()):
-                    for handle in handles:
-                        state = self.nixl_wrapper.check_xfer_state(handle)
-                        if state == "PROC":
-                            pending = True
-                        elif state != "DONE":
-                            raise RuntimeError(
-                                "NIXL transfer failed while quiescing: "
-                                f"{state}"
-                            )
-            if not pending:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out draining NIXL transfers")
+        while pending := self._pending_lifecycle_work():
+            # Keep the completion and push-writer paths live until all request
+            # bookkeeping is drained. Stopping them first can strand a live
+            # handshake or notification across the checkpoint boundary.
+            self.get_finished()
+            if self._pending_lifecycle_work() and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out draining NIXL connector state: " + ", ".join(pending)
+                )
             time.sleep(0.01)
+        self._stop_push_writer_for_lifecycle()
+        self._stop_handshake_executor()
+        if pending := self._pending_lifecycle_work():
+            raise RuntimeError(
+                "NIXL connector created work while quiescing: " + ", ".join(pending)
+            )
+        self._discard_push_work_for_lifecycle()
         self._release_transport_state()
 
     def release_for_checkpoint(self) -> None:
@@ -1545,13 +1583,13 @@ class NixlBaseConnectorWorker:
         # to release device-backed RDMA mappings before CRIU.
         if self.nixl_wrapper is not None:
             self.quiesce()
-        self.nixl_wrapper = self._nixl_wrapper_cls(
-            str(uuid.uuid4()), self._nixl_config
-        )
+        self._refresh_local_scheduler_endpoint()
+        self.nixl_wrapper = self._nixl_wrapper_cls(str(uuid.uuid4()), self._nixl_config)
         self._new_handshake_executor()
         try:
             self.register_kv_caches(self._registered_kv_caches)
             self._publish_handshake_metadata()
+            self._checkpoint_quiescing = False
         except Exception:
             self._release_transport_state()
             raise

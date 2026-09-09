@@ -5,6 +5,7 @@
 import socket
 import threading
 import time
+import weakref
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -48,6 +49,18 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+_LOCAL_SCHEDULERS: weakref.WeakValueDictionary[str, "NixlBaseConnectorScheduler"] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def get_local_nixl_scheduler(
+    engine_id: EngineId,
+) -> "NixlBaseConnectorScheduler | None":
+    """Return the scheduler connector in this process, if one exists."""
+    return _LOCAL_SCHEDULERS.get(engine_id)
 
 
 class NixlBaseConnectorScheduler:
@@ -190,12 +203,15 @@ class NixlBaseConnectorScheduler:
                 self.kv_recompute_threshold,
                 self.decoder_kv_blocks_ttl,
             )
+        _LOCAL_SCHEDULERS[self.engine_id] = self
 
     def shutdown(self):
         self._stop_event.set()
         if self._nixl_handshake_listener_t is not None:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
+        if _LOCAL_SCHEDULERS.get(self.engine_id) is self:
+            _LOCAL_SCHEDULERS.pop(self.engine_id, None)
 
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
@@ -327,20 +343,29 @@ class NixlBaseConnectorScheduler:
 
         # Only start the listener when we have metadata to serve.
         if self._nixl_handshake_listener_t is None:
-            ready_event = threading.Event()
-            self._nixl_handshake_listener_t = threading.Thread(
-                target=self._nixl_handshake_listener,
-                args=(
-                    ready_event,
-                    self._stop_event,
-                    self.side_channel_host,
-                    self.side_channel_port,
-                ),
-                daemon=True,
-                name="nixl_handshake_listener",
-            )
-            self._nixl_handshake_listener_t.start()
-            ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+            self._start_handshake_listener()
+
+    def _start_handshake_listener(self) -> None:
+        ready_event = threading.Event()
+        listener = threading.Thread(
+            target=self._nixl_handshake_listener,
+            args=(
+                ready_event,
+                self._stop_event,
+                self.side_channel_host,
+                self.side_channel_port,
+            ),
+            daemon=True,
+            name="nixl_handshake_listener",
+        )
+        self._nixl_handshake_listener_t = listener
+        listener.start()
+        if ready_event.wait(timeout=5.0):
+            return
+        self._stop_event.set()
+        listener.join(timeout=5.0)
+        self._nixl_handshake_listener_t = None
+        raise RuntimeError("Timed out starting NIXL handshake listener")
 
     def refresh_handshake_endpoint(self) -> None:
         """Rebind the handshake listener after a pod IP changes."""
@@ -351,20 +376,14 @@ class NixlBaseConnectorScheduler:
         if listener is not None:
             self._stop_event.set()
             listener.join(timeout=5.0)
+            if listener.is_alive():
+                raise RuntimeError("Timed out stopping NIXL handshake listener")
         self.side_channel_host = host
         self._stop_event = threading.Event()
         self._nixl_handshake_listener_t = None
         if not self._encoded_handshake_data:
             return
-        ready_event = threading.Event()
-        self._nixl_handshake_listener_t = threading.Thread(
-            target=self._nixl_handshake_listener,
-            args=(ready_event, self._stop_event, self.side_channel_host, self.side_channel_port),
-            daemon=True,
-            name="nixl_handshake_listener",
-        )
-        self._nixl_handshake_listener_t.start()
-        ready_event.wait()
+        self._start_handshake_listener()
 
     def update_xfer_handshake_metadata(
         self, pp_rank: int, tp_rank: int, metadata: NixlHandshakePayload
@@ -387,9 +406,7 @@ class NixlBaseConnectorScheduler:
         """Background thread for getting new NIXL handshakes."""
         # Keep the old static-call shape usable for downstream tests/tools.
         metadata = self if isinstance(self, dict) else None
-        metadata_lock = (
-            None if metadata is not None else self._handshake_metadata_lock
-        )
+        metadata_lock = None if metadata is not None else self._handshake_metadata_lock
         # NOTE(rob): this is a simple implementation. We will move
         # to a better approach via HTTP endpoint soon.
 

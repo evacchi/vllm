@@ -476,6 +476,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 remaining = max(0.0, deadline - time.monotonic())
             connector.quiesce(remaining)
 
+    def release_for_checkpoint(self) -> None:
+        for connector in self._connectors:
+            connector.release_for_checkpoint()
+
     def reinitialize(self) -> None:
         if not self._connectors:
             return
