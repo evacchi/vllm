@@ -78,16 +78,12 @@ def test_scheduler_refreshes_after_ip_change(monkeypatch) -> None:
     assert scheduler.side_channel_host == "10.0.0.2"
 
 
-def test_worker_reinitialization_refreshes_local_scheduler_first(monkeypatch) -> None:
-    class _Scheduler:
-        def __init__(self):
-            self.refresh_handshake_endpoint = lambda: events.append("refresh-scheduler")
-
+def test_worker_reinitialization_refreshes_scheduler_first(monkeypatch) -> None:
     events = []
-    scheduler = _Scheduler()
-    monkeypatch.setitem(base_scheduler._LOCAL_SCHEDULERS, "engine", scheduler)
     worker = object.__new__(NixlBaseConnectorWorker)
     worker.engine_id = "engine"
+    worker.pp_rank = 0
+    worker.tp_rank = 0
     worker.nixl_wrapper = None
     worker._registered_kv_caches = {"layer": object()}
     worker._nixl_config = object()
@@ -95,6 +91,7 @@ def test_worker_reinitialization_refreshes_local_scheduler_first(monkeypatch) ->
     worker._new_handshake_executor = lambda: events.append("new-executor")
     worker.register_kv_caches = lambda _: events.append("register-caches")
     worker._publish_handshake_metadata = lambda: events.append("publish-metadata")
+    worker._refresh_scheduler_endpoint = lambda: events.append("refresh-scheduler")
 
     worker.reinitialize()
 

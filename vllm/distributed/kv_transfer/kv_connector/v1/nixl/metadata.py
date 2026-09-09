@@ -20,6 +20,7 @@ ReqId = str
 
 GET_META_MSG = b"get_meta_msg"
 UPDATE_META_MSG = b"update_meta_msg"
+REFRESH_ENDPOINT_MSG = b"refresh_endpoint_msg"
 
 # Push-mode (WRITE-based) registration notification.
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as

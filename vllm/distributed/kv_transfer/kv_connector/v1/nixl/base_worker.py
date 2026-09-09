@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    REFRESH_ENDPOINT_MSG,
     UPDATE_META_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
@@ -1433,22 +1434,27 @@ class NixlBaseConnectorWorker:
         # current pod address when publishing refreshed metadata.
         host = socket.gethostbyname(socket.gethostname())
         path = make_zmq_path("tcp", host, port)
-        try:
-            with zmq_ctx(zmq.REQ, path) as sock:
-                sock.setsockopt(zmq.RCVTIMEO, 2000)
-                msg = msgspec.msgpack.encode(
-                    (
-                        UPDATE_META_MSG,
-                        pp_rank,
-                        self.tp_rank,
-                        msgspec.msgpack.encode(self.xfer_handshake_metadata),
-                    )
-                )
-                sock.send(msg)
-                if sock.recv() != b"ok":
-                    raise RuntimeError("NIXL scheduler rejected metadata update")
-        except Exception as exc:
-            raise RuntimeError("Could not publish refreshed NIXL metadata") from exc
+        msg = msgspec.msgpack.encode(
+            (
+                UPDATE_META_MSG,
+                pp_rank,
+                self.tp_rank,
+                msgspec.msgpack.encode(self.xfer_handshake_metadata),
+            )
+        )
+        last_error: Exception | None = None
+        for _ in range(10):
+            try:
+                with zmq_ctx(zmq.REQ, path) as sock:
+                    sock.setsockopt(zmq.RCVTIMEO, 2000)
+                    sock.send(msg)
+                    if sock.recv() != b"ok":
+                        raise RuntimeError("NIXL scheduler rejected metadata update")
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.1)
+        raise RuntimeError("Could not publish refreshed NIXL metadata") from last_error
 
     def _release_transport_state(self) -> None:
         """Release NIXL state while retaining connector configuration and caches."""
@@ -1525,19 +1531,29 @@ class NixlBaseConnectorWorker:
         )
         return tuple(name for name in names if pending(name))
 
-    def _refresh_local_scheduler_endpoint(self) -> None:
-        """Refresh the scheduler listener that shares this EngineCore process."""
-        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
-            get_local_nixl_scheduler,
+    def _refresh_scheduler_endpoint(self) -> None:
+        """Ask the scheduler process to rebind its handshake listener."""
+        port = (
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            + self.vllm_config.parallel_config.data_parallel_index
         )
-
-        scheduler = get_local_nixl_scheduler(self.engine_id)
-        if scheduler is None:
-            raise RuntimeError(
-                "NIXL checkpoint reinitialize requires a scheduler connector "
-                "in the local EngineCore process"
-            )
-        scheduler.refresh_handshake_endpoint()
+        path = make_zmq_path("tcp", envs.VLLM_NIXL_SIDE_CHANNEL_HOST, port)
+        try:
+            with zmq_ctx(zmq.REQ, path) as sock:
+                sock.setsockopt(zmq.RCVTIMEO, 2000)
+                sock.send(
+                    msgspec.msgpack.encode(
+                        (
+                            REFRESH_ENDPOINT_MSG,
+                            getattr(self, "pp_rank", 0),
+                            self.tp_rank,
+                        )
+                    )
+                )
+                if sock.recv() != b"ok":
+                    raise RuntimeError("NIXL scheduler rejected endpoint refresh")
+        except Exception as exc:
+            raise RuntimeError("Could not refresh NIXL scheduler endpoint") from exc
 
     def _new_handshake_executor(self) -> None:
         self._handshake_initiation_executor = ThreadPoolExecutor(
@@ -1583,7 +1599,7 @@ class NixlBaseConnectorWorker:
         # to release device-backed RDMA mappings before CRIU.
         if self.nixl_wrapper is not None:
             self.quiesce()
-        self._refresh_local_scheduler_endpoint()
+        self._refresh_scheduler_endpoint()
         self.nixl_wrapper = self._nixl_wrapper_cls(str(uuid.uuid4()), self._nixl_config)
         self._new_handshake_executor()
         try:

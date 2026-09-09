@@ -23,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    REFRESH_ENDPOINT_MSG,
     UPDATE_META_MSG,
     HeartbeatInfo,
     NixlConnectorMetadata,
@@ -413,6 +414,7 @@ class NixlBaseConnectorScheduler:
         # Listen for new requests for metadata.
         path = make_zmq_path("tcp", host, port)
         logger.debug("Starting listening on path: %s", path)
+        refresh_requested = False
         with zmq_ctx(zmq.ROUTER, path) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
             ready_event.set()
@@ -444,6 +446,19 @@ class NixlBaseConnectorScheduler:
                             ] = decoded[3]
                     sock.send_multipart((identity, b"", b"ok", b""))
                     continue
+                if msg == REFRESH_ENDPOINT_MSG:
+                    if len(decoded) != 3:
+                        logger.warning("Invalid NIXL endpoint refresh message")
+                        sock.send_multipart((identity, b"", b"error", b""))
+                        continue
+                    sock.send_multipart((identity, b"", b"ok", b""))
+                    if (
+                        socket.gethostbyname(socket.gethostname())
+                        != self.side_channel_host
+                    ):
+                        refresh_requested = True
+                        stop_event.set()
+                    continue
                 if msg != GET_META_MSG:
                     logger.warning("Connection listener got unexpected message %s", msg)
                 # Echo our perf_counter so P can estimate the clock offset.
@@ -466,6 +481,12 @@ class NixlBaseConnectorScheduler:
                     sock.send_multipart((identity, b"", b"error", b""))
                     continue
                 sock.send_multipart((identity, b"", payload, ts))
+        if refresh_requested:
+            self.side_channel_host = socket.gethostbyname(socket.gethostname())
+            self._stop_event = threading.Event()
+            self._nixl_handshake_listener_t = None
+            if self._encoded_handshake_data:
+                self._start_handshake_listener()
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
