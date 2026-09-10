@@ -22,15 +22,10 @@ import ray
 import torch
 import zmq
 
-from tests.v1.attention.utils import dense_kv_cache_views
 from tests.utils import ensure_current_vllm_config
+from tests.v1.attention.utils import dense_kv_cache_views
 from vllm import LLM
 from vllm.config import KVTransferConfig, set_current_vllm_config
-from vllm.distributed.parallel_state import (
-    cleanup_dist_env_and_memory,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
     KVOutputAggregator,
@@ -61,6 +56,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
     has_kv_transfer_group,
+)
+from vllm.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
+    init_distributed_environment,
+    initialize_model_parallel,
 )
 from vllm.forward_context import ForwardContext
 from vllm.outputs import RequestOutput
@@ -2267,7 +2267,7 @@ def test_shutdown_cleans_up_resources(default_vllm_config, gloo_dist_init):
         worker.shutdown()
         worker.shutdown()
 
-        mock_exec.shutdown.assert_called_with(wait=False, cancel_futures=True)
+        mock_exec.shutdown.assert_called_with(wait=True, cancel_futures=True)
 
         # Same sequence on scheduler.shutdown()
         scheduler.shutdown()
@@ -2451,6 +2451,7 @@ def test_reinitialize_rebuilds_transport_from_retained_caches():
     worker._new_handshake_executor = MagicMock()
     worker.register_kv_caches = MagicMock()
     worker._publish_handshake_metadata = MagicMock()
+    worker._refresh_local_scheduler_endpoint = MagicMock()
 
     worker.reinitialize()
 
@@ -2473,6 +2474,7 @@ def test_reinitialize_releases_replacement_state_on_failure():
     worker._new_handshake_executor = MagicMock()
     worker.register_kv_caches = MagicMock(side_effect=RuntimeError("register"))
     worker._release_transport_state = MagicMock()
+    worker._refresh_local_scheduler_endpoint = MagicMock()
 
     with pytest.raises(RuntimeError, match="register"):
         worker.reinitialize()
@@ -2480,7 +2482,9 @@ def test_reinitialize_releases_replacement_state_on_failure():
     worker._release_transport_state.assert_called_once_with()
 
 
-@pytest.mark.parametrize("state, error", [("ERROR", RuntimeError), ("PROC", TimeoutError)])
+@pytest.mark.parametrize(
+    "state, error", [("ERROR", RuntimeError), ("PROC", TimeoutError)]
+)
 def test_quiesce_rejects_failed_or_timed_out_transfers(state, error):
     """Transport state remains intact when a transfer cannot be drained."""
     worker = object.__new__(NixlConnectorWorker)
@@ -2497,6 +2501,7 @@ def test_quiesce_rejects_failed_or_timed_out_transfers(state, error):
         worker.quiesce(timeout=0)
 
     worker._release_transport_state.assert_not_called()
+    assert not worker._checkpoint_quiescing
 
 
 def test_scheduler_metadata_replacement_updates_one_worker_payload():
@@ -2518,7 +2523,9 @@ def test_scheduler_metadata_replacement_updates_one_worker_payload():
         (GET_META_MSG, 0, 0),
     ],
 )
-def test_scheduler_metadata_listener_replies_immediately_to_invalid_requests(request_data):
+def test_scheduler_metadata_listener_replies_immediately_to_invalid_requests(
+    request_data,
+):
     """Invalid or missing metadata must produce an error reply, not a timeout."""
 
     class FakeSocket:

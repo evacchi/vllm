@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the NIXL checkpoint lifecycle API."""
 
+import contextlib
+import queue
 import socket
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1 import multi_connector
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -91,7 +95,9 @@ def test_worker_reinitialization_refreshes_scheduler_first(monkeypatch) -> None:
     worker._new_handshake_executor = lambda: events.append("new-executor")
     worker.register_kv_caches = lambda _: events.append("register-caches")
     worker._publish_handshake_metadata = lambda: events.append("publish-metadata")
-    worker._refresh_scheduler_endpoint = lambda: events.append("refresh-scheduler")
+    worker._refresh_local_scheduler_endpoint = lambda: events.append(
+        "refresh-scheduler"
+    )
 
     worker.reinitialize()
 
@@ -104,10 +110,43 @@ def test_worker_reinitialization_refreshes_scheduler_first(monkeypatch) -> None:
     ]
 
 
+def test_refresh_local_scheduler_endpoint_uses_registry(monkeypatch) -> None:
+    # reinitialize() must talk to the co-located scheduler directly: this
+    # milestone's scope excludes P/D and multi-GPU topologies (see
+    # RFC-nixl-connector-lifecycle.md), so scheduler and worker always share
+    # one EngineCore process and a same-process call is correct and simpler
+    # than a ZMQ round trip to a listener address the worker cannot know.
+    scheduler = SimpleNamespace(refresh_handshake_endpoint=Mock())
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker.engine_id = "engine-1"
+    monkeypatch.setattr(
+        base_scheduler, "get_local_nixl_scheduler", lambda engine_id: scheduler
+    )
+
+    worker._refresh_local_scheduler_endpoint()
+
+    scheduler.refresh_handshake_endpoint.assert_called_once_with()
+
+
+def test_refresh_local_scheduler_endpoint_requires_local_scheduler(
+    monkeypatch,
+) -> None:
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker.engine_id = "engine-1"
+    monkeypatch.setattr(
+        base_scheduler, "get_local_nixl_scheduler", lambda engine_id: None
+    )
+
+    with pytest.raises(RuntimeError, match="local EngineCore process"):
+        worker._refresh_local_scheduler_endpoint()
+
+
 def test_quiesce_drains_all_lifecycle_work_before_stopping_threads() -> None:
     events = []
     worker = object.__new__(NixlBaseConnectorWorker)
     worker._recving_metadata = {"request": object()}
+    worker._quiesce_drained_sending = set()
+    worker._quiesce_drained_recving = set()
 
     def get_finished():
         events.append("get-finished")
@@ -148,6 +187,85 @@ def test_quiesce_tracks_handshake_and_push_work() -> None:
         "_pending_d_registrations",
         "_reg_send_inbox",
     )
+
+
+def test_quiesce_accumulates_ids_drained_while_stopping() -> None:
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker._recving_metadata = {"request": object()}
+    worker._quiesce_drained_sending = set()
+    worker._quiesce_drained_recving = set()
+
+    def get_finished():
+        worker._recving_metadata.clear()
+        return {"sent-1"}, {"recv-1"}
+
+    worker.get_finished = get_finished
+    worker._stop_push_writer_for_lifecycle = lambda: None
+    worker._stop_handshake_executor = lambda: None
+    worker._discard_push_work_for_lifecycle = lambda: None
+    worker._release_transport_state = lambda: None
+
+    worker.quiesce(timeout=1.0)
+
+    assert worker._quiesce_drained_sending == {"sent-1"}
+    assert worker._quiesce_drained_recving == {"recv-1"}
+
+
+def test_get_finished_reports_ids_drained_during_quiesce() -> None:
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker.transfer_topo = object()
+    worker.tp_rank = 0
+    worker._recving_transfers = {}
+    worker._recving_metadata = {}
+    worker._failed_recv_reqs = queue.Queue()
+    worker._reqs_to_send = {}
+    worker._get_new_notifs = lambda: set()
+    worker._pop_done_transfers = lambda _transfers: set()
+    worker._quiesce_drained_sending = {"sent-1"}
+    worker._quiesce_drained_recving = {"recv-1"}
+
+    done_sending, done_recving = worker.get_finished()
+
+    assert done_sending == {"sent-1"}
+    assert done_recving == {"recv-1"}
+    # Reported exactly once: the accumulator is cleared after being drained.
+    assert worker._quiesce_drained_sending == set()
+    assert worker._quiesce_drained_recving == set()
+
+
+def test_quiesce_timeout_resets_quiescing_flag() -> None:
+    # No thread/executor teardown happened, so it is safe to resume normal
+    # handshake operation after a drain timeout.
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker._pending_lifecycle_work = lambda: ("_ready_requests",)
+    worker.get_finished = lambda: (set(), set())
+    worker._quiesce_drained_sending = set()
+    worker._quiesce_drained_recving = set()
+
+    with contextlib.suppress(TimeoutError):
+        worker.quiesce(timeout=0.0)
+
+    assert worker._checkpoint_quiescing is False
+
+
+def test_quiesce_keeps_quiescing_flag_after_teardown_before_abort() -> None:
+    # Once the handshake executor and push writer are stopped, only
+    # reinitialize() can restore them; the flag must stay set so callers
+    # keep hitting the guarded "quiescing" error instead of using torn-down
+    # state (e.g. a None executor).
+    worker = object.__new__(NixlBaseConnectorWorker)
+    pending_calls = [(), ("_ready_requests",)]
+    worker._pending_lifecycle_work = lambda: pending_calls.pop(0)
+    worker.get_finished = lambda: (set(), set())
+    worker._quiesce_drained_sending = set()
+    worker._quiesce_drained_recving = set()
+    worker._stop_push_writer_for_lifecycle = lambda: None
+    worker._stop_handshake_executor = lambda: None
+
+    with contextlib.suppress(RuntimeError):
+        worker.quiesce(timeout=1.0)
+
+    assert worker._checkpoint_quiescing is True
 
 
 def test_publish_handshake_uses_current_pod_ip(monkeypatch) -> None:
