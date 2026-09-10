@@ -130,7 +130,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     # --- Lifecycle ----------------------------------------------------- #
 
-    def _stop_push_writer_for_lifecycle(self):
+    def _stop_push_writer(self):
         self._push_writer_stop.set()
         self._push_writer_wake.set()
         if self._push_writer_thread is not None:
@@ -147,7 +147,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             except queue.Empty:
                 return
 
-    def _discard_push_work_for_lifecycle(self):
+    def _discard_push_work(self):
         self._clear_queue(self._reg_send_inbox)
         self._clear_queue(self._finished_blocks_inbox)
         self._clear_queue(self._deferred_push_inbox)

@@ -50,6 +50,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Bound on how long a handshake-listener start/stop may take: starting
+# (waiting for its ready signal) and stopping (waiting for its thread to
+# exit) during both normal startup and refresh_handshake_endpoint()'s rebind.
+_HANDSHAKE_LISTENER_TIMEOUT_S = 5.0
 
 _LOCAL_SCHEDULERS: weakref.WeakValueDictionary[str, "NixlBaseConnectorScheduler"] = (
     weakref.WeakValueDictionary()
@@ -360,10 +364,10 @@ class NixlBaseConnectorScheduler:
         )
         self._nixl_handshake_listener_t = listener
         listener.start()
-        if ready_event.wait(timeout=5.0):
+        if ready_event.wait(timeout=_HANDSHAKE_LISTENER_TIMEOUT_S):
             return
         self._stop_event.set()
-        listener.join(timeout=5.0)
+        listener.join(timeout=_HANDSHAKE_LISTENER_TIMEOUT_S)
         self._nixl_handshake_listener_t = None
         raise RuntimeError("Timed out starting NIXL handshake listener")
 
@@ -375,7 +379,7 @@ class NixlBaseConnectorScheduler:
         listener = self._nixl_handshake_listener_t
         if listener is not None:
             self._stop_event.set()
-            listener.join(timeout=5.0)
+            listener.join(timeout=_HANDSHAKE_LISTENER_TIMEOUT_S)
             if listener.is_alive():
                 raise RuntimeError("Timed out stopping NIXL handshake listener")
         self.side_channel_host = host
@@ -385,7 +389,7 @@ class NixlBaseConnectorScheduler:
             return
         self._start_handshake_listener()
 
-    def update_xfer_handshake_metadata(
+    def update_handshake_metadata(
         self, pp_rank: int, tp_rank: int, metadata: NixlHandshakePayload
     ) -> None:
         """Atomically replace one worker's payload served by the listener."""

@@ -94,6 +94,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Default budget for quiesce() to drain in-flight transfers before giving
+# up, and the poll interval used while waiting for that state to clear.
+_DEFAULT_QUIESCE_TIMEOUT_S = 30.0
+_QUIESCE_POLL_INTERVAL_S = 0.01
+
+
 def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     """Return whether all views share storage and a block stride."""
     block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
@@ -1420,11 +1426,11 @@ class NixlBaseConnectorWorker:
             executor.shutdown(wait=wait, cancel_futures=True)
             self._handshake_initiation_executor = None
 
-    def _stop_push_writer_for_lifecycle(self) -> None:
+    def _stop_push_writer(self) -> None:
         """Hook for push mode's additional NIXL thread."""
         return None
 
-    def _discard_push_work_for_lifecycle(self) -> None:
+    def _discard_push_work(self) -> None:
         """Discard connector-specific work that has not created a handle."""
         return None
 
@@ -1446,7 +1452,7 @@ class NixlBaseConnectorWorker:
                 "NIXL checkpoint reinitialize requires a scheduler connector "
                 "in the local EngineCore process"
             )
-        scheduler.update_xfer_handshake_metadata(
+        scheduler.update_handshake_metadata(
             getattr(self, "pp_rank", 0), self.tp_rank, self.xfer_handshake_metadata
         )
 
@@ -1524,7 +1530,7 @@ class NixlBaseConnectorWorker:
             )
         )
 
-    def _refresh_local_scheduler_endpoint(self) -> None:
+    def _refresh_local_scheduler(self) -> None:
         """Refresh the scheduler listener that shares this EngineCore process."""
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
             get_local_nixl_scheduler,
@@ -1548,7 +1554,7 @@ class NixlBaseConnectorWorker:
         self._checkpoint_quiescing = True
         torn_down = False
         try:
-            timeout = timeout if timeout is not None else 30.0
+            timeout = timeout if timeout is not None else _DEFAULT_QUIESCE_TIMEOUT_S
             deadline = time.monotonic() + timeout
             while pending := self._pending_lifecycle_work():
                 # Keep the completion and push-writer paths live until all request
@@ -1563,15 +1569,15 @@ class NixlBaseConnectorWorker:
                     raise TimeoutError(
                         "Timed out draining NIXL connector state: " + ", ".join(pending)
                     )
-                time.sleep(0.01)
-            self._stop_push_writer_for_lifecycle()
+                time.sleep(_QUIESCE_POLL_INTERVAL_S)
+            self._stop_push_writer()
             self._stop_handshake_executor()
             torn_down = True
             if pending := self._pending_lifecycle_work():
                 raise RuntimeError(
                     "NIXL connector created work while quiescing: " + ", ".join(pending)
                 )
-            self._discard_push_work_for_lifecycle()
+            self._discard_push_work()
             self._release_transport_state()
         except Exception:
             # Once the executor and push writer are stopped, only
@@ -1597,7 +1603,7 @@ class NixlBaseConnectorWorker:
         # to release device-backed RDMA mappings before CRIU.
         if self.nixl_wrapper is not None:
             self.quiesce()
-        self._refresh_local_scheduler_endpoint()
+        self._refresh_local_scheduler()
         self.nixl_wrapper = self._nixl_wrapper_cls(str(uuid.uuid4()), self._nixl_config)
         self._new_handshake_executor()
         try:
@@ -3050,7 +3056,7 @@ class NixlBaseConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
-        self._stop_push_writer_for_lifecycle()
+        self._stop_push_writer()
         # Stop before _release_transport_state() so its own (wait=True)
         # stop call below is a no-op: process teardown must not block on
         # an in-flight handshake to a dead peer.

@@ -94,9 +94,7 @@ def test_worker_reinitialization_refreshes_scheduler_first(monkeypatch) -> None:
     worker._new_handshake_executor = lambda: events.append("new-executor")
     worker.register_kv_caches = lambda _: events.append("register-caches")
     worker._publish_handshake_metadata = lambda: events.append("publish-metadata")
-    worker._refresh_local_scheduler_endpoint = lambda: events.append(
-        "refresh-scheduler"
-    )
+    worker._refresh_local_scheduler = lambda: events.append("refresh-scheduler")
 
     worker.reinitialize()
 
@@ -109,7 +107,7 @@ def test_worker_reinitialization_refreshes_scheduler_first(monkeypatch) -> None:
     ]
 
 
-def test_refresh_local_scheduler_endpoint_uses_registry(monkeypatch) -> None:
+def test_refresh_local_scheduler_uses_registry(monkeypatch) -> None:
     # reinitialize() must talk to the co-located scheduler directly: this
     # milestone's scope excludes P/D and multi-GPU topologies (see
     # RFC-nixl-connector-lifecycle.md), so scheduler and worker always share
@@ -122,12 +120,12 @@ def test_refresh_local_scheduler_endpoint_uses_registry(monkeypatch) -> None:
         base_scheduler, "get_local_nixl_scheduler", lambda engine_id: scheduler
     )
 
-    worker._refresh_local_scheduler_endpoint()
+    worker._refresh_local_scheduler()
 
     scheduler.refresh_handshake_endpoint.assert_called_once_with()
 
 
-def test_refresh_local_scheduler_endpoint_requires_local_scheduler(
+def test_refresh_local_scheduler_requires_local_scheduler(
     monkeypatch,
 ) -> None:
     worker = object.__new__(NixlBaseConnectorWorker)
@@ -137,7 +135,7 @@ def test_refresh_local_scheduler_endpoint_requires_local_scheduler(
     )
 
     with pytest.raises(RuntimeError, match="local EngineCore process"):
-        worker._refresh_local_scheduler_endpoint()
+        worker._refresh_local_scheduler()
 
 
 def test_quiesce_drains_all_lifecycle_work_before_stopping_threads() -> None:
@@ -153,9 +151,9 @@ def test_quiesce_drains_all_lifecycle_work_before_stopping_threads() -> None:
         return set(), set()
 
     worker.get_finished = get_finished
-    worker._stop_push_writer_for_lifecycle = lambda: events.append("stop-push-writer")
+    worker._stop_push_writer = lambda: events.append("stop-push-writer")
     worker._stop_handshake_executor = lambda: events.append("stop-handshake-executor")
-    worker._discard_push_work_for_lifecycle = lambda: events.append("discard-push-work")
+    worker._discard_push_work = lambda: events.append("discard-push-work")
     worker._release_transport_state = lambda: events.append("release-transport")
 
     worker.quiesce(timeout=1.0)
@@ -194,9 +192,9 @@ def test_quiesce_accumulates_ids_drained_while_stopping() -> None:
         return {"sent-1"}, {"recv-1"}
 
     worker.get_finished = get_finished
-    worker._stop_push_writer_for_lifecycle = lambda: None
+    worker._stop_push_writer = lambda: None
     worker._stop_handshake_executor = lambda: None
-    worker._discard_push_work_for_lifecycle = lambda: None
+    worker._discard_push_work = lambda: None
     worker._release_transport_state = lambda: None
 
     worker.quiesce(timeout=1.0)
@@ -253,7 +251,7 @@ def test_quiesce_keeps_quiescing_flag_after_teardown_before_abort() -> None:
     worker.get_finished = lambda: (set(), set())
     worker._quiesce_drained_sending = set()
     worker._quiesce_drained_recving = set()
-    worker._stop_push_writer_for_lifecycle = lambda: None
+    worker._stop_push_writer = lambda: None
     worker._stop_handshake_executor = lambda: None
 
     with contextlib.suppress(RuntimeError):
@@ -263,12 +261,12 @@ def test_quiesce_keeps_quiescing_flag_after_teardown_before_abort() -> None:
 
 
 def test_publish_handshake_metadata_uses_local_scheduler(monkeypatch) -> None:
-    # Same reasoning as _refresh_local_scheduler_endpoint: this milestone's
+    # Same reasoning as _refresh_local_scheduler: this milestone's
     # scope excludes P/D and multi-GPU topologies, so scheduler and worker
     # always share one EngineCore process and a same-process call is
     # correct -- a ZMQ round trip has no reliable address to dial (see
     # RFC-nixl-connector-lifecycle.md).
-    scheduler = SimpleNamespace(update_xfer_handshake_metadata=Mock())
+    scheduler = SimpleNamespace(update_handshake_metadata=Mock())
     worker = object.__new__(NixlBaseConnectorWorker)
     worker.engine_id = "engine-1"
     worker.pp_rank = 0
@@ -282,7 +280,7 @@ def test_publish_handshake_metadata_uses_local_scheduler(monkeypatch) -> None:
 
     worker._publish_handshake_metadata()
 
-    scheduler.update_xfer_handshake_metadata.assert_called_once_with(
+    scheduler.update_handshake_metadata.assert_called_once_with(
         0, 0, worker.xfer_handshake_metadata
     )
 

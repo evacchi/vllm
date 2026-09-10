@@ -2390,7 +2390,7 @@ def test_push_lifecycle_rejects_a_writer_that_does_not_stop():
     worker._push_writer_thread.is_alive.return_value = True
 
     with pytest.raises(RuntimeError, match="push writer did not stop"):
-        worker._stop_push_writer_for_lifecycle()
+        worker._stop_push_writer()
 
     worker._push_writer_thread.join.assert_called_once_with(timeout=2)
     assert worker._push_writer_stop.is_set()
@@ -2417,7 +2417,7 @@ def test_push_lifecycle_discards_queued_work():
     ):
         work_queue.put("stale")
 
-    worker._discard_push_work_for_lifecycle()
+    worker._discard_push_work()
 
     assert all(
         work_queue.empty()
@@ -2450,7 +2450,7 @@ def test_reinitialize_rebuilds_transport_from_retained_caches():
     worker._new_handshake_executor = MagicMock()
     worker.register_kv_caches = MagicMock()
     worker._publish_handshake_metadata = MagicMock()
-    worker._refresh_local_scheduler_endpoint = MagicMock()
+    worker._refresh_local_scheduler = MagicMock()
 
     worker.reinitialize()
 
@@ -2473,7 +2473,7 @@ def test_reinitialize_releases_replacement_state_on_failure():
     worker._new_handshake_executor = MagicMock()
     worker.register_kv_caches = MagicMock(side_effect=RuntimeError("register"))
     worker._release_transport_state = MagicMock()
-    worker._refresh_local_scheduler_endpoint = MagicMock()
+    worker._refresh_local_scheduler = MagicMock()
 
     with pytest.raises(RuntimeError, match="register"):
         worker.reinitialize()
@@ -2491,9 +2491,9 @@ def test_quiesce_rejects_failed_or_timed_out_transfers(state, error):
     worker._recving_transfers = {"request": [1]}
     worker.nixl_wrapper = MagicMock()
     worker.nixl_wrapper.check_xfer_state.return_value = state
-    worker._stop_push_writer_for_lifecycle = MagicMock()
+    worker._stop_push_writer = MagicMock()
     worker._stop_handshake_executor = MagicMock()
-    worker._discard_push_work_for_lifecycle = MagicMock()
+    worker._discard_push_work = MagicMock()
     worker._release_transport_state = MagicMock()
 
     with pytest.raises(error):
@@ -2510,7 +2510,7 @@ def test_scheduler_metadata_replacement_updates_one_worker_payload():
     scheduler._encoded_handshake_data = {(0, 0): b"old"}
     payload = NixlHandshakePayload(b"compat", b"new-agent")
 
-    scheduler.update_xfer_handshake_metadata(0, 0, payload)
+    scheduler.update_handshake_metadata(0, 0, payload)
 
     assert scheduler._encoded_handshake_data[(0, 0)] == msgspec.msgpack.encode(payload)
 
