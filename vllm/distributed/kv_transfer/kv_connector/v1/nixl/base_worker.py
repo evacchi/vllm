@@ -7,7 +7,6 @@ import itertools
 import logging
 import os
 import queue
-import socket
 import threading
 import time
 import uuid
@@ -22,7 +21,6 @@ import numpy as np
 import torch
 import zmq
 
-from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -37,7 +35,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
-    UPDATE_META_MSG,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -1439,37 +1436,19 @@ class NixlBaseConnectorWorker:
         """Tell the scheduler about the fresh agent metadata after rebuild."""
         if self.xfer_handshake_metadata is None:
             return
-        port = (
-            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
-            + self.vllm_config.parallel_config.data_parallel_index
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+            get_local_nixl_scheduler,
         )
-        pp_rank = getattr(self, "pp_rank", 0)
-        # CRIU restores the process environment verbatim, so the pod-IP
-        # downward API value may refer to the pre-checkpoint pod. Resolve the
-        # current pod address when publishing refreshed metadata.
-        host = socket.gethostbyname(socket.gethostname())
-        path = make_zmq_path("tcp", host, port)
-        msg = msgspec.msgpack.encode(
-            (
-                UPDATE_META_MSG,
-                pp_rank,
-                self.tp_rank,
-                msgspec.msgpack.encode(self.xfer_handshake_metadata),
+
+        scheduler = get_local_nixl_scheduler(self.engine_id)
+        if scheduler is None:
+            raise RuntimeError(
+                "NIXL checkpoint reinitialize requires a scheduler connector "
+                "in the local EngineCore process"
             )
+        scheduler.update_xfer_handshake_metadata(
+            getattr(self, "pp_rank", 0), self.tp_rank, self.xfer_handshake_metadata
         )
-        last_error: Exception | None = None
-        for _ in range(10):
-            try:
-                with zmq_ctx(zmq.REQ, path) as sock:
-                    sock.setsockopt(zmq.RCVTIMEO, 2000)
-                    sock.send(msg)
-                    if sock.recv() != b"ok":
-                        raise RuntimeError("NIXL scheduler rejected metadata update")
-                return
-            except Exception as exc:
-                last_error = exc
-                time.sleep(0.1)
-        raise RuntimeError("Could not publish refreshed NIXL metadata") from last_error
 
     def _release_transport_state(self) -> None:
         """Release NIXL state while retaining connector configuration and caches."""

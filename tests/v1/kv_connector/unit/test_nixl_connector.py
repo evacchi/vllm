@@ -2433,64 +2433,6 @@ def test_push_lifecycle_discards_queued_work():
     assert not worker._pending_d_registrations
 
 
-def test_publish_handshake_metadata_propagates_failures():
-    """A failed metadata update must make reinitialization fail visibly."""
-    worker = object.__new__(NixlConnectorWorker)
-    worker.shutdown = MagicMock()
-    worker.xfer_handshake_metadata = MagicMock()
-    worker.tp_rank = 0
-    worker.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_index=0)
-    )
-
-    with (
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.zmq_ctx",
-            side_effect=OSError("side channel unavailable"),
-        ),
-        pytest.raises(RuntimeError, match="metadata"),
-    ):
-        worker._publish_handshake_metadata()
-
-
-@pytest.mark.parametrize("reply", [b"error", b"unexpected"])
-def test_publish_handshake_metadata_rejects_non_ok_reply(reply):
-    """A scheduler rejection must fail the worker-side metadata refresh."""
-
-    class FakeSocket:
-        def setsockopt(self, *_args):
-            pass
-
-        def send(self, _msg):
-            pass
-
-        def recv(self):
-            return reply
-
-    class FakeContext:
-        def __enter__(self):
-            return FakeSocket()
-
-        def __exit__(self, *_args):
-            pass
-
-    worker = object.__new__(NixlConnectorWorker)
-    worker.xfer_handshake_metadata = MagicMock()
-    worker.tp_rank = 0
-    worker.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_index=0)
-    )
-
-    with (
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.zmq_ctx",
-            return_value=FakeContext(),
-        ),
-        pytest.raises(RuntimeError, match="metadata"),
-    ):
-        worker._publish_handshake_metadata()
-
-
 # ── TTL-based remote engine eviction tests ──────────────────────────
 
 

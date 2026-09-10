@@ -12,7 +12,6 @@ import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1 import multi_connector
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     base_scheduler,
-    base_worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
@@ -263,47 +262,53 @@ def test_quiesce_keeps_quiescing_flag_after_teardown_before_abort() -> None:
     assert worker._checkpoint_quiescing is True
 
 
-def test_publish_handshake_uses_current_pod_ip(monkeypatch) -> None:
-    class _Socket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def setsockopt(self, *args):
-            pass
-
-        def send(self, message):
-            self.message = message
-
-        def recv(self):
-            return b"ok"
-
-    socket_context = _Socket()
-    paths = []
+def test_publish_handshake_metadata_uses_local_scheduler(monkeypatch) -> None:
+    # Same reasoning as _refresh_local_scheduler_endpoint: this milestone's
+    # scope excludes P/D and multi-GPU topologies, so scheduler and worker
+    # always share one EngineCore process and a same-process call is
+    # correct -- a ZMQ round trip has no reliable address to dial (see
+    # RFC-nixl-connector-lifecycle.md).
+    scheduler = SimpleNamespace(update_xfer_handshake_metadata=Mock())
     worker = object.__new__(NixlBaseConnectorWorker)
+    worker.engine_id = "engine-1"
+    worker.pp_rank = 0
+    worker.tp_rank = 0
     worker.xfer_handshake_metadata = NixlHandshakePayload(
         compatibility_hash="hash", agent_metadata_bytes=b"metadata"
     )
-    worker.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_index=0)
-    )
-    worker.pp_rank = 0
-    worker.tp_rank = 0
-    monkeypatch.setattr(base_worker.socket, "gethostname", lambda: "pod")
-    monkeypatch.setattr(base_worker.socket, "gethostbyname", lambda _: "10.0.0.9")
     monkeypatch.setattr(
-        base_worker, "make_zmq_path", lambda *_args: "tcp://10.0.0.9:5600"
+        base_scheduler, "get_local_nixl_scheduler", lambda engine_id: scheduler
     )
-
-    def _zmq_ctx(_socket_type, path):
-        paths.append(path)
-        return socket_context
-
-    monkeypatch.setattr(base_worker, "zmq_ctx", _zmq_ctx)
 
     worker._publish_handshake_metadata()
 
-    assert paths == ["tcp://10.0.0.9:5600"]
-    assert socket_context.message
+    scheduler.update_xfer_handshake_metadata.assert_called_once_with(
+        0, 0, worker.xfer_handshake_metadata
+    )
+
+
+def test_publish_handshake_metadata_requires_local_scheduler(monkeypatch) -> None:
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker.engine_id = "engine-1"
+    worker.xfer_handshake_metadata = NixlHandshakePayload(
+        compatibility_hash="hash", agent_metadata_bytes=b"metadata"
+    )
+    monkeypatch.setattr(
+        base_scheduler, "get_local_nixl_scheduler", lambda engine_id: None
+    )
+
+    with pytest.raises(RuntimeError, match="local EngineCore process"):
+        worker._publish_handshake_metadata()
+
+
+def test_publish_handshake_metadata_skips_without_metadata(monkeypatch) -> None:
+    """No agent metadata yet -> nothing to publish, no scheduler lookup."""
+    worker = object.__new__(NixlBaseConnectorWorker)
+    worker.xfer_handshake_metadata = None
+    monkeypatch.setattr(
+        base_scheduler,
+        "get_local_nixl_scheduler",
+        lambda engine_id: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+
+    worker._publish_handshake_metadata()
