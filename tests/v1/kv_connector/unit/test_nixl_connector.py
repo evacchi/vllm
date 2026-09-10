@@ -2267,7 +2267,10 @@ def test_shutdown_cleans_up_resources(default_vllm_config, gloo_dist_init):
         worker.shutdown()
         worker.shutdown()
 
-        mock_exec.shutdown.assert_called_with(wait=True, cancel_futures=True)
+        # shutdown() must not block engine teardown on an in-flight handshake
+        # to a dead peer; only quiesce() needs the wait=True ordering
+        # guarantee against a concurrent add_remote_agent.
+        mock_exec.shutdown.assert_called_with(wait=False, cancel_futures=True)
 
         # Same sequence on scheduler.shutdown()
         scheduler.shutdown()
@@ -2321,6 +2324,60 @@ def test_release_transport_state_retains_registered_cache_mapping():
 
     assert worker._registered_kv_caches == caches
     assert worker.device_kv_caches == {}
+
+
+def test_release_transport_state_locks_push_handle_release():
+    """Releasing push-mode's outgoing transfers must hold the same lock
+    push_worker.shutdown() takes, so a concurrent submit can't race the
+    handle release."""
+    worker = object.__new__(NixlPushConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker._registered_kv_caches = {}
+    worker.device_kv_caches = {}
+    worker.host_xfer_buffers = {}
+    worker._handshake_initiation_executor = None
+    worker._recving_transfers = {}
+    worker.src_xfer_handles_by_block_size = {}
+    worker.src_xfer_handles_by_tp_ratio = {}
+    worker._remote_agents = {}
+    worker._engine_clock_offset = {}
+    worker.kv_caches_base_addr = defaultdict(dict)
+    worker.dst_xfer_side_handles = defaultdict(dict)
+    worker.dst_num_blocks = {}
+    worker._handshake_futures = {}
+    worker._engine_last_active = {}
+    worker._registered_descs = []
+    worker.xfer_handshake_metadata = None
+    worker.compat_hash = None
+    worker.transfer_topo = None
+    worker.block_len_per_layer = []
+    worker.block_stride_per_layer = []
+    worker._region_is_mla = []
+    worker._ssm_region_indices = []
+    worker._scratch_region_indices = []
+    worker._ple_region_index = None
+
+    released = []
+    worker.nixl_wrapper = MagicMock()
+    worker.nixl_wrapper.release_xfer_handle = lambda h: released.append(h)
+    worker._sending_transfers = {"req": ["handle-1"]}
+
+    lock_events = []
+
+    class _TrackingLock:
+        def __enter__(self):
+            lock_events.append("enter")
+
+        def __exit__(self, *args):
+            lock_events.append("exit")
+
+    worker._sending_transfers_lock = _TrackingLock()
+
+    worker._release_transport_state()
+
+    assert released == ["handle-1"]
+    assert worker._sending_transfers == {}
+    assert lock_events == ["enter", "exit"]
 
 
 def test_push_lifecycle_rejects_a_writer_that_does_not_stop():

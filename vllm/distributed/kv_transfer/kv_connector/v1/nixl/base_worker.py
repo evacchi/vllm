@@ -1409,11 +1409,18 @@ class NixlBaseConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
-    def _stop_handshake_executor(self) -> None:
-        """Stop handshake work so no operation can use a retired agent."""
+    def _stop_handshake_executor(self, wait: bool = True) -> None:
+        """Stop handshake work so no operation can use a retired agent.
+
+        ``wait=True`` (the default) is required before releasing transport
+        state, so a completing handshake cannot race
+        ``deregister_memory``/``remove_remote_agent``. Process teardown has
+        no such race to guard against, so it passes ``wait=False`` to avoid
+        blocking on an in-flight handshake to a dead peer.
+        """
         executor = getattr(self, "_handshake_initiation_executor", None)
         if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=wait, cancel_futures=True)
             self._handshake_initiation_executor = None
 
     def _stop_push_writer_for_lifecycle(self) -> None:
@@ -1422,6 +1429,10 @@ class NixlBaseConnectorWorker:
 
     def _discard_push_work_for_lifecycle(self) -> None:
         """Discard connector-specific work that has not created a handle."""
+        return None
+
+    def _release_push_handles(self) -> None:
+        """Hook for push mode's outgoing-transfer NIXL handles."""
         return None
 
     def _publish_handshake_metadata(self) -> None:
@@ -1467,11 +1478,7 @@ class NixlBaseConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
-        for handles in getattr(self, "_sending_transfers", {}).values():
-            for handle in handles:
-                self.nixl_wrapper.release_xfer_handle(handle)
-        if hasattr(self, "_sending_transfers"):
-            self._sending_transfers.clear()
+        self._release_push_handles()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         for handles in self.src_xfer_handles_by_tp_ratio.values():
@@ -1505,8 +1512,14 @@ class NixlBaseConnectorWorker:
         self._scratch_region_indices.clear()
         self._ple_region_index = None
 
-    def _pending_lifecycle_work(self) -> tuple[str, ...]:
-        """Return connector state that must be empty before checkpointing."""
+    def _pending_names(self, names: tuple[str, ...]) -> tuple[str, ...]:
+        """Return the subset of `names` holding unfinished lifecycle work.
+
+        Shared by the base class and push mode's `_pending_lifecycle_work`
+        override, so each class's own state stays declared next to the
+        attributes it names -- renaming or adding a queue in one place can't
+        silently drop out of the other's checkpoint-readiness check.
+        """
 
         def pending(name: str) -> bool:
             value = getattr(self, name, None)
@@ -1515,25 +1528,22 @@ class NixlBaseConnectorWorker:
             empty = getattr(value, "empty", None)
             return not empty() if callable(empty) else bool(value)
 
-        names = (
-            "_recving_transfers",
-            "_recving_metadata",
-            "_reqs_to_send",
-            "_reqs_to_process",
-            "consumer_notification_counts_by_req",
-            "expected_consumer_notifications_by_req",
-            "_handshake_futures",
-            "_ready_requests",
-            "_sending_transfers",
-            "_push_finished_blocks",
-            "_pending_d_registrations",
-            "_reg_send_inbox",
-            "_finished_blocks_inbox",
-            "_pending_completion_notifs",
-            "_evict_finished_inbox",
-            "_deferred_push_inbox",
-        )
         return tuple(name for name in names if pending(name))
+
+    def _pending_lifecycle_work(self) -> tuple[str, ...]:
+        """Return connector state that must be empty before checkpointing."""
+        return self._pending_names(
+            (
+                "_recving_transfers",
+                "_recving_metadata",
+                "_reqs_to_send",
+                "_reqs_to_process",
+                "consumer_notification_counts_by_req",
+                "expected_consumer_notifications_by_req",
+                "_handshake_futures",
+                "_ready_requests",
+            )
+        )
 
     def _refresh_local_scheduler_endpoint(self) -> None:
         """Refresh the scheduler listener that shares this EngineCore process."""
@@ -3062,20 +3072,8 @@ class NixlBaseConnectorWorker:
             # error happens during init, no need to shutdown
             return
         self._stop_push_writer_for_lifecycle()
-        self._stop_handshake_executor()
-        for handles in self._recving_transfers.values():
-            for handle in handles:
-                self.nixl_wrapper.release_xfer_handle(handle)
-        self._recving_transfers.clear()
-        for handle in self.src_xfer_handles_by_block_size.values():
-            self.nixl_wrapper.release_dlist_handle(handle)
-        self.src_xfer_handles_by_block_size.clear()
-        for handles in self.src_xfer_handles_by_tp_ratio.values():
-            for handle in handles:
-                self.nixl_wrapper.release_dlist_handle(handle)
-        self.src_xfer_handles_by_tp_ratio.clear()
-        for engine_id in list(self._remote_agents):
-            self._cleanup_remote_engine(engine_id, log_eviction=False)
-        for desc in self._registered_descs:
-            self.nixl_wrapper.deregister_memory(desc)
-        self._registered_descs.clear()
+        # Stop before _release_transport_state() so its own (wait=True)
+        # stop call below is a no-op: process teardown must not block on
+        # an in-flight handshake to a dead peer.
+        self._stop_handshake_executor(wait=False)
+        self._release_transport_state()

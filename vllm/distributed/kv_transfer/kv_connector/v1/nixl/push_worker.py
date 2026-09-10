@@ -156,6 +156,28 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._push_finished_blocks.clear()
         self._pending_d_registrations.clear()
 
+    def _pending_lifecycle_work(self) -> tuple[str, ...]:
+        """Extend the base drain check with push-mode's writer-owned state."""
+        return super()._pending_lifecycle_work() + self._pending_names(
+            (
+                "_sending_transfers",
+                "_push_finished_blocks",
+                "_pending_d_registrations",
+                "_reg_send_inbox",
+                "_finished_blocks_inbox",
+                "_pending_completion_notifs",
+                "_evict_finished_inbox",
+                "_deferred_push_inbox",
+            )
+        )
+
+    def _release_push_handles(self) -> None:
+        with self._sending_transfers_lock:
+            for handles in self._sending_transfers.values():
+                for handle in handles:
+                    self.nixl_wrapper.release_xfer_handle(handle)
+            self._sending_transfers.clear()
+
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
         self._push_writer_stop.clear()
         super().register_kv_caches(kv_caches)
@@ -175,11 +197,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         if self._push_writer_thread is not None:
             self._push_writer_thread.join(timeout=2)
             self._push_writer_thread = None
-        with self._sending_transfers_lock:
-            for handles in self._sending_transfers.values():
-                for handle in handles:
-                    self.nixl_wrapper.release_xfer_handle(handle)
-            self._sending_transfers.clear()
+        # super().shutdown() -> _release_transport_state() releases
+        # _sending_transfers via the _release_push_handles() hook.
         super().shutdown()
 
     # --- Engine-main-thread entry point -------------------------------- #

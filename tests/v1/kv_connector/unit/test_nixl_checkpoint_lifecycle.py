@@ -170,22 +170,17 @@ def test_quiesce_drains_all_lifecycle_work_before_stopping_threads() -> None:
     ]
 
 
-def test_quiesce_tracks_handshake_and_push_work() -> None:
+def test_quiesce_tracks_handshake_work() -> None:
+    # Push-mode's own queues are checked by NixlPushConnectorWorker's
+    # override (tests/v1/kv_connector/unit/test_nixl_push_connector.py);
+    # the base class only knows about its own (pull-mode) state.
     worker = object.__new__(NixlBaseConnectorWorker)
     worker._handshake_futures = {"engine": object()}
     worker._ready_requests = object()
-    worker._sending_transfers = {"request": [object()]}
-    worker._push_finished_blocks = {"request": [[1]]}
-    worker._pending_d_registrations = {"request": {}}
-    worker._reg_send_inbox = object()
 
     assert worker._pending_lifecycle_work() == (
         "_handshake_futures",
         "_ready_requests",
-        "_sending_transfers",
-        "_push_finished_blocks",
-        "_pending_d_registrations",
-        "_reg_send_inbox",
     )
 
 
